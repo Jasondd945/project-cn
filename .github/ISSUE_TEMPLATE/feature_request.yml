@@ -1,0 +1,35 @@
+name: Feature request
+description: 提议新能力、协议改进或使用体验优化
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题
+      description: 先说问题，不要只说方案
+      placeholder: 当前哪里不够好，或者缺了什么
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      placeholder: 你建议怎样改
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 影响范围
+      placeholder: 会影响哪些命令、文件、协议或用户场景
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案
+      placeholder: 你考虑过但没有采用的其他方案
+    validations:
+      required: false

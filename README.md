@@ -2,8 +2,8 @@
 
 > 将项目复制为同级 `A-CN` 中文镜像的通用 skill
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)]()
-[![License](https://img.shields.io/badge/license-MIT-green)]()
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 ## 简介
 
@@ -23,8 +23,6 @@
 - 支持 `status / resume / scope / mark / report`
 - 支持中断续跑和结果校验
 - 不依赖外部翻译或注释 API
-
-**类比**：project-cn 就像一个"智能复印机+翻译官"组合——它不仅完整复印你的项目，还能把说明书翻译成中文，给代码加上中文注释贴纸，而且原件一个字都不改！📠
 
 ## 快速使用
 
@@ -111,7 +109,7 @@ project-cn/
 详细规则以 [SKILL.md](./SKILL.md) 为准。
 
 
-## 工作流程 🔄
+## 工作流程
 
 ```
 用户请求
@@ -125,7 +123,7 @@ project-cn/
 【校验】生成最终报告、验证完整性
 ```
 
-## 常见问题 ❓
+## 常见问题
 
 ### Q: 会修改原项目吗？
 
@@ -148,17 +146,19 @@ project-cn/
 
 **A**: 支持。对于大项目（文档和代码文件 >200），可以使用多子智能体并行处理，显著提升速度。
 
-## 文档 📚
+## 文档
 
-- **[SKILL.md](./SKILL.md)** - 完整技能文档（519行）
+- **[SKILL.md](./SKILL.md)** - 完整技能文档
 - **[references/document-rules.md](./references/document-rules.md)** - 文档翻译规则
 - **[references/code-rules.md](./references/code-rules.md)** - 代码注释规则
 
-## 贡献 🤝
+## 贡献
 
-欢迎提交 Issue 和 Pull Request！
+欢迎提交 Issue 和 Pull Request。
 
-## 许可证 📄
+- 提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)
+- 安全问题请先看 [SECURITY.md](./SECURITY.md)
 
-MIT License
+## 许可证
 
+本项目使用 [MIT License](./LICENSE)。

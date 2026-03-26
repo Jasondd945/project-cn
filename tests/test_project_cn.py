@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -6,6 +7,8 @@ import unittest
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+os.environ.setdefault("PYTHONUTF8", "1")
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +19,13 @@ import job_runner  # noqa: E402
 import job_state  # noqa: E402
 import planning  # noqa: E402
 from classification import classify_file  # noqa: E402
+
+
+SUBPROCESS_ENV = {
+    **os.environ,
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUTF8": "1",
+}
 
 
 class ProjectCnTests(unittest.TestCase):
@@ -283,6 +293,9 @@ class ProjectCnTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=SUBPROCESS_ENV,
                 check=False,
             )
 
@@ -312,6 +325,9 @@ class ProjectCnTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=SUBPROCESS_ENV,
                 check=False,
             )
 
@@ -614,6 +630,9 @@ class ProjectCnTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=SUBPROCESS_ENV,
                 check=False,
             )
 
@@ -654,6 +673,9 @@ class ProjectCnTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=SUBPROCESS_ENV,
                 check=False,
             )
 

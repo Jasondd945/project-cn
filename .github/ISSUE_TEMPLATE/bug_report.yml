@@ -1,0 +1,57 @@
+name: Bug report
+description: 报告 project-cn 的缺陷、回归或异常行为
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 简要说明问题是什么，以及为什么这是问题
+      placeholder: 简要描述问题
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 按顺序写出复现方式
+      placeholder: |
+        1. 运行 ...
+        2. 传入 ...
+        3. 看到 ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      placeholder: 描述你期望发生的结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      placeholder: 描述实际发生的结果
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境信息
+      placeholder: |
+        - OS:
+        - Python:
+        - Agent/Runner:
+        - project-cn version/commit:
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: 补充信息
+      description: 可附日志、截图、报告摘要，但不要贴敏感信息
+    validations:
+      required: false
