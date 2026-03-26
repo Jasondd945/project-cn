@@ -70,6 +70,13 @@ temp/
 tmp/
 test-output/
 
+# Generated translation outputs
+*-CN/
+*-中文版/
+AAA-translate-output/
+translate-*.json
+translate-*.txt
+
 # Temporary files
 *.tmp
 *.bak

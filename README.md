@@ -108,7 +108,7 @@ project-cn/
 └─ tests/
 ```
 
-详细规则以 [SKILL.md](C:/Users/11738/Desktop/test/skills/project-cn/SKILL.md) 为准。
+详细规则以 [SKILL.md](./SKILL.md) 为准。
 
 
 ## 工作流程 🔄
@@ -162,5 +162,3 @@ project-cn/
 
 MIT License
 
-
-🌏
