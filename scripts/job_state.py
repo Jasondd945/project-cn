@@ -31,8 +31,39 @@ STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 
-FINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_SKIPPED}
+FINAL_STATUSES = {STATUS_COMPLETED, STATUS_SKIPPED}
+UNRESOLVED_STATUSES = {STATUS_PENDING, STATUS_IN_PROGRESS, STATUS_FAILED}
 LLM_CATEGORIES = {"document", "code"}
+
+SCOPE_TIER_1_ONLY = "tier_1_only"
+SCOPE_TIER_1_AND_2 = "tier_1_and_2"
+SCOPE_ALL_TIERS = "all_tiers"
+SCOPE_DECISION_SKIP_TIER_3 = "skip_tier_3"
+
+PRIORITY_TIER_LABELS = {
+    1: "核心理解层",
+    2: "重要扩展层",
+    3: "外围噪声层",
+}
+
+SCOPE_ALLOWED_TIERS = {
+    SCOPE_TIER_1_ONLY: {1},
+    SCOPE_TIER_1_AND_2: {1, 2},
+    SCOPE_ALL_TIERS: {1, 2, 3},
+}
+
+SCOPE_DECISION_OPTIONS = [
+    SCOPE_TIER_1_ONLY,
+    SCOPE_TIER_1_AND_2,
+    SCOPE_ALL_TIERS,
+    SCOPE_DECISION_SKIP_TIER_3,
+]
+
+SCOPE_LABELS = {
+    SCOPE_TIER_1_ONLY: "仅 1 档",
+    SCOPE_TIER_1_AND_2: "1 档 + 2 档",
+    SCOPE_ALL_TIERS: "全部 1 + 2 + 3 档",
+}
 
 
 def utc_timestamp() -> str:
@@ -130,6 +161,11 @@ def build_progress(
                 "copied_file": manifest_item.get("copied_file"),
                 "cn_file": manifest_item.get("cn_file"),
                 "batch_index": manifest_item.get("batch_index"),
+                "priority_tier": manifest_item.get("priority_tier", 2),
+                "priority_tier_label": manifest_item.get(
+                    "priority_tier_label",
+                    PRIORITY_TIER_LABELS.get(manifest_item.get("priority_tier", 2), "重要扩展层"),
+                ),
                 "status": status,
                 "attempt_count": 0,
                 "last_error": last_error,
@@ -140,6 +176,9 @@ def build_progress(
             }
         )
 
+    selected_priority_scope = _default_selected_scope(manifest)
+    scope_decision_recommended = bool(manifest.get("summary", {}).get("priority_tier_decision_recommended"))
+
     progress = {
         "job_id": job_id,
         "src_root": manifest["src_root"],
@@ -147,6 +186,13 @@ def build_progress(
         "batch_size": batch_size,
         "refresh_every_batches": refresh_every_batches,
         "refresh_every_files": refresh_every_files,
+        "selected_priority_scope": selected_priority_scope,
+        "scope_decision_recommended": scope_decision_recommended,
+        "scope_finalized": selected_priority_scope == SCOPE_ALL_TIERS,
+        "skipped_priority_tiers": [],
+        "next_locked_tier": None,
+        "awaiting_scope_decision": False,
+        "scope_history": [],
         "started_at": created_at,
         "updated_at": created_at,
         "summary": {},
@@ -155,6 +201,7 @@ def build_progress(
         "refresh_checkpoints": [],
         "items": items,
     }
+    _refresh_scope_state(progress)
     progress["summary"] = summarize_progress(progress)
     return progress
 
@@ -162,14 +209,16 @@ def build_progress(
 def summarize_progress(progress: dict) -> dict:
     items = progress.get("items", [])
     llm_items = [item for item in items if item["category"] in LLM_CATEGORIES]
-    all_batches = sorted({item["batch_index"] for item in llm_items if item.get("batch_index")})
+    in_scope_llm_items = [item for item in llm_items if is_item_in_selected_scope(progress, item)]
+    all_batches = sorted({item["batch_index"] for item in llm_items if item.get("batch_index") is not None})
     pending_batches = sorted(
         {
             item["batch_index"]
-            for item in llm_items
+            for item in in_scope_llm_items
             if item["status"] == STATUS_PENDING and item.get("batch_index") is not None
         }
     )
+    active_batch = progress.get("active_batch")
 
     summary = {
         "total_items": len(items),
@@ -185,19 +234,34 @@ def summarize_progress(progress: dict) -> dict:
         "in_progress_llm_files": _count_by_status(llm_items, STATUS_IN_PROGRESS),
         "completed_llm_files": _count_by_status(llm_items, STATUS_COMPLETED),
         "failed_llm_files": _count_by_status(llm_items, STATUS_FAILED),
+        "pending_llm_files_in_scope": _count_by_status(in_scope_llm_items, STATUS_PENDING),
+        "in_progress_llm_files_in_scope": _count_by_status(in_scope_llm_items, STATUS_IN_PROGRESS),
+        "completed_llm_files_in_scope": _count_by_status(in_scope_llm_items, STATUS_COMPLETED),
+        "failed_llm_files_in_scope": _count_by_status(in_scope_llm_items, STATUS_FAILED),
         "next_pending_batch_index": pending_batches[0] if pending_batches else None,
-        "active_batch_index": None,
+        "active_batch_index": active_batch.get("batch_index") if active_batch else None,
         "refresh_checkpoint_count": len(progress.get("refresh_checkpoints", [])),
+        "selected_priority_scope": progress.get("selected_priority_scope"),
+        "selected_priority_scope_label": SCOPE_LABELS.get(
+            progress.get("selected_priority_scope"),
+            progress.get("selected_priority_scope"),
+        ),
+        "scope_decision_recommended": progress.get("scope_decision_recommended", False),
+        "scope_finalized": progress.get("scope_finalized", False),
+        "skipped_priority_tiers": list(progress.get("skipped_priority_tiers", [])),
+        "next_locked_tier": progress.get("next_locked_tier"),
+        "awaiting_scope_decision": progress.get("awaiting_scope_decision", False),
+        "locked_priority_tiers": _locked_priority_tiers(progress),
+        "locked_llm_files": _count_locked_llm_files(progress),
+        "remaining_priority_tiers": _build_remaining_priority_tiers(progress),
+        "next_action": _next_action(progress),
     }
-
-    active_batch = progress.get("active_batch")
-    if active_batch:
-        summary["active_batch_index"] = active_batch.get("batch_index")
-
     return summary
 
 
 def checkout_next_batch(progress: dict, retry_failed: bool = False) -> dict:
+    _refresh_scope_state(progress)
+
     active_items = _current_in_progress_items(progress)
     if active_items:
         batch_index = active_items[0]["batch_index"]
@@ -207,26 +271,18 @@ def checkout_next_batch(progress: dict, retry_failed: bool = False) -> dict:
         progress["updated_at"] = utc_timestamp()
         return _build_batch_payload(progress, batch_index, active_items, checkpoint, reused=True)
 
-    candidates = [
-        item for item in progress["items"] if item["category"] in LLM_CATEGORIES and item["status"] == STATUS_PENDING
-    ]
+    candidates = _scope_candidates(progress, STATUS_PENDING)
     if not candidates and retry_failed:
-        candidates = [
-            item for item in progress["items"] if item["category"] in LLM_CATEGORIES and item["status"] == STATUS_FAILED
-        ]
+        candidates = _scope_candidates(progress, STATUS_FAILED)
 
     if not candidates:
         progress["active_batch"] = None
+        _refresh_scope_state(progress)
         progress["summary"] = summarize_progress(progress)
         progress["updated_at"] = utc_timestamp()
-        return {
-            "batch_index": None,
-            "refresh_checkpoint_id": None,
-            "required_reads": [],
-            "items": [],
-            "reused_in_progress_batch": False,
-            "status": "complete",
-        }
+        if progress.get("awaiting_scope_decision", False):
+            return _build_scope_wait_payload(progress)
+        return _build_complete_payload(progress)
 
     batch_index = min(item["batch_index"] for item in candidates if item.get("batch_index") is not None)
     batch_items = [item for item in candidates if item.get("batch_index") == batch_index]
@@ -246,9 +302,11 @@ def checkout_next_batch(progress: dict, retry_failed: bool = False) -> dict:
         "batch_index": batch_index,
         "checkpoint_id": checkpoint["checkpoint_id"],
         "started_at": started_at,
+        "priority_tier": batch_items[0].get("priority_tier"),
         "file_ids": [item["file_id"] for item in batch_items],
     }
     progress["updated_at"] = started_at
+    _refresh_scope_state(progress)
     progress["summary"] = summarize_progress(progress)
     return _build_batch_payload(progress, batch_index, batch_items, checkpoint, reused=False)
 
@@ -274,8 +332,43 @@ def update_item_status(progress: dict, file_id: str, status: str, error: str | N
 
     _finalize_active_batch(progress, now)
     progress["updated_at"] = now
+    _refresh_scope_state(progress)
     progress["summary"] = summarize_progress(progress)
     return item
+
+
+def set_scope_decision(progress: dict, decision: str) -> dict:
+    if decision not in SCOPE_DECISION_OPTIONS:
+        raise ValueError(f"unsupported scope decision: {decision}")
+
+    selected_priority_scope, scope_finalized, skipped_priority_tiers = _normalize_scope_decision(decision)
+    _validate_scope_transition(progress, selected_priority_scope, skipped_priority_tiers)
+
+    now = utc_timestamp()
+    progress["selected_priority_scope"] = selected_priority_scope
+    progress["scope_finalized"] = scope_finalized
+    progress["skipped_priority_tiers"] = skipped_priority_tiers
+    progress.setdefault("scope_history", []).append(
+        {
+            "decision": decision,
+            "selected_priority_scope": selected_priority_scope,
+            "scope_finalized": scope_finalized,
+            "skipped_priority_tiers": skipped_priority_tiers,
+            "decided_at": now,
+        }
+    )
+    progress["updated_at"] = now
+    _refresh_scope_state(progress)
+    progress["summary"] = summarize_progress(progress)
+    return {
+        "decision": decision,
+        "selected_priority_scope": selected_priority_scope,
+        "scope_finalized": scope_finalized,
+        "skipped_priority_tiers": skipped_priority_tiers,
+        "awaiting_scope_decision": progress["awaiting_scope_decision"],
+        "next_locked_tier": progress["next_locked_tier"],
+        "summary": progress["summary"],
+    }
 
 
 def build_originals_lock(manifest: dict) -> dict:
@@ -323,6 +416,26 @@ def verify_originals_lock(lock: dict) -> dict:
     }
 
 
+def is_item_in_selected_scope(progress: dict, item: dict) -> bool:
+    if item.get("priority_tier") in progress.get("skipped_priority_tiers", []):
+        return False
+    return item.get("priority_tier") in _selected_allowed_tiers(progress)
+
+
+def should_expect_cn_file(progress: dict | None, item: dict) -> bool:
+    if item.get("category") not in LLM_CATEGORIES:
+        return False
+    if progress is None:
+        return True
+    return is_item_in_selected_scope(progress, item)
+
+
+def _default_selected_scope(manifest: dict) -> str:
+    if manifest.get("summary", {}).get("priority_tier_decision_recommended"):
+        return SCOPE_TIER_1_ONLY
+    return SCOPE_ALL_TIERS
+
+
 def _initial_status(manifest_item: dict) -> str:
     if manifest_item.get("copy_failure"):
         return STATUS_FAILED
@@ -335,9 +448,21 @@ def _count_by_status(items: list[dict], status: str) -> int:
     return sum(1 for item in items if item["status"] == status)
 
 
+def _scope_candidates(progress: dict, status: str) -> list[dict]:
+    candidates = [
+        item
+        for item in progress["items"]
+        if item["category"] in LLM_CATEGORIES
+        and item["status"] == status
+        and is_item_in_selected_scope(progress, item)
+    ]
+    candidates.sort(key=lambda item: ((item.get("batch_index") or 0), item["file_id"]))
+    return candidates
+
+
 def _current_in_progress_items(progress: dict) -> list[dict]:
     items = [item for item in progress["items"] if item["status"] == STATUS_IN_PROGRESS]
-    items.sort(key=lambda item: (item.get("batch_index") or 0, item["file_id"]))
+    items.sort(key=lambda item: ((item.get("batch_index") or 0), item["file_id"]))
     return items
 
 
@@ -384,6 +509,8 @@ def _build_batch_payload(
             "copied_file": item.get("copied_file"),
             "cn_file": item.get("cn_file"),
             "batch_index": item.get("batch_index"),
+            "priority_tier": item.get("priority_tier"),
+            "priority_tier_label": item.get("priority_tier_label"),
             "status": item["status"],
             "attempt_count": item["attempt_count"],
             "refresh_checkpoint_id": item.get("refresh_checkpoint_id"),
@@ -397,8 +524,38 @@ def _build_batch_payload(
         "refresh_checkpoint_id": checkpoint["checkpoint_id"] if checkpoint else None,
         "required_reads": checkpoint.get("required_reads", []) if checkpoint else [],
         "items": items,
+        "selected_priority_scope": progress.get("selected_priority_scope"),
+        "selected_priority_scope_label": SCOPE_LABELS.get(progress.get("selected_priority_scope")),
         "reused_in_progress_batch": reused,
         "status": "ready",
+    }
+
+
+def _build_scope_wait_payload(progress: dict) -> dict:
+    return {
+        "batch_index": None,
+        "refresh_checkpoint_id": None,
+        "required_reads": [],
+        "items": [],
+        "reused_in_progress_batch": False,
+        "selected_priority_scope": progress.get("selected_priority_scope"),
+        "selected_priority_scope_label": SCOPE_LABELS.get(progress.get("selected_priority_scope")),
+        "next_locked_tier": progress.get("next_locked_tier"),
+        "decision_options": list(SCOPE_DECISION_OPTIONS),
+        "status": "awaiting_scope_decision",
+    }
+
+
+def _build_complete_payload(progress: dict) -> dict:
+    return {
+        "batch_index": None,
+        "refresh_checkpoint_id": None,
+        "required_reads": [],
+        "items": [],
+        "reused_in_progress_batch": False,
+        "selected_priority_scope": progress.get("selected_priority_scope"),
+        "selected_priority_scope_label": SCOPE_LABELS.get(progress.get("selected_priority_scope")),
+        "status": "complete",
     }
 
 
@@ -425,10 +582,139 @@ def _finalize_active_batch(progress: dict, finished_at: str) -> None:
             "checkpoint_id": active_batch.get("checkpoint_id"),
             "started_at": active_batch.get("started_at"),
             "completed_at": finished_at,
+            "priority_tier": active_batch.get("priority_tier"),
             "file_ids": active_batch.get("file_ids", []),
         }
     )
     progress["active_batch"] = None
+
+
+def _selected_allowed_tiers(progress: dict) -> set[int]:
+    selected = progress.get("selected_priority_scope", SCOPE_ALL_TIERS)
+    allowed_tiers = set(SCOPE_ALLOWED_TIERS.get(selected, {1, 2, 3}))
+    allowed_tiers.difference_update(progress.get("skipped_priority_tiers", []))
+    return allowed_tiers
+
+
+def _refresh_scope_state(progress: dict) -> None:
+    next_locked_tier = _compute_next_locked_tier(progress)
+    has_in_scope_unresolved = any(
+        is_item_in_selected_scope(progress, item) and _is_unresolved_item(item)
+        for item in progress["items"]
+        if item["category"] in LLM_CATEGORIES
+    )
+    has_active_batch = progress.get("active_batch") is not None
+    awaiting_scope_decision = (
+        not progress.get("scope_finalized", False)
+        and not has_active_batch
+        and not has_in_scope_unresolved
+        and next_locked_tier is not None
+    )
+
+    progress["next_locked_tier"] = next_locked_tier
+    progress["awaiting_scope_decision"] = awaiting_scope_decision
+
+
+def _compute_next_locked_tier(progress: dict) -> int | None:
+    locked_tiers = _locked_priority_tiers(progress)
+    return locked_tiers[0] if locked_tiers else None
+
+
+def _locked_priority_tiers(progress: dict) -> list[int]:
+    allowed_tiers = _selected_allowed_tiers(progress)
+    skipped_tiers = set(progress.get("skipped_priority_tiers", []))
+    locked_tiers = sorted(
+        {
+            item.get("priority_tier")
+            for item in progress["items"]
+            if item["category"] in LLM_CATEGORIES
+            and _is_unresolved_item(item)
+            and item.get("priority_tier") not in allowed_tiers
+            and item.get("priority_tier") not in skipped_tiers
+        }
+    )
+    return [tier for tier in locked_tiers if tier is not None]
+
+
+def _count_locked_llm_files(progress: dict) -> int:
+    return sum(
+        1
+        for item in progress["items"]
+        if item["category"] in LLM_CATEGORIES
+        and _is_unresolved_item(item)
+        and not is_item_in_selected_scope(progress, item)
+        and item.get("priority_tier") not in progress.get("skipped_priority_tiers", [])
+    )
+
+
+def _build_remaining_priority_tiers(progress: dict) -> dict:
+    allowed_tiers = _selected_allowed_tiers(progress)
+    skipped_tiers = set(progress.get("skipped_priority_tiers", []))
+    remaining = {}
+
+    for tier in (1, 2, 3):
+        unresolved_items = [
+            item
+            for item in progress["items"]
+            if item.get("priority_tier") == tier and _is_unresolved_item(item)
+        ]
+        remaining[f"tier_{tier}"] = {
+            "tier": tier,
+            "label": PRIORITY_TIER_LABELS[tier],
+            "allowed": tier in allowed_tiers,
+            "locked": tier not in allowed_tiers and tier not in skipped_tiers and bool(unresolved_items),
+            "skipped": tier in skipped_tiers,
+            "remaining_files": len(unresolved_items),
+            "remaining_document_files": sum(1 for item in unresolved_items if item["category"] == "document"),
+            "remaining_code_files": sum(1 for item in unresolved_items if item["category"] == "code"),
+            "remaining_other_files": sum(1 for item in unresolved_items if item["category"] == "other"),
+        }
+
+    return remaining
+
+
+def _next_action(progress: dict) -> str:
+    if progress.get("active_batch"):
+        return "finish_current_batch"
+    if progress.get("awaiting_scope_decision"):
+        next_locked_tier = progress.get("next_locked_tier")
+        if next_locked_tier is not None:
+            return f"ask_user_about_tier_{next_locked_tier}"
+        return "await_scope_decision"
+    if _scope_candidates(progress, STATUS_PENDING) or _scope_candidates(progress, STATUS_FAILED):
+        return "resume"
+    return "report"
+
+
+def _is_unresolved_item(item: dict) -> bool:
+    return item["status"] in UNRESOLVED_STATUSES
+
+
+def _normalize_scope_decision(decision: str) -> tuple[str, bool, list[int]]:
+    if decision == SCOPE_TIER_1_ONLY:
+        return SCOPE_TIER_1_ONLY, False, []
+    if decision == SCOPE_TIER_1_AND_2:
+        return SCOPE_TIER_1_AND_2, False, []
+    if decision == SCOPE_ALL_TIERS:
+        return SCOPE_ALL_TIERS, True, []
+    if decision == SCOPE_DECISION_SKIP_TIER_3:
+        return SCOPE_TIER_1_AND_2, True, [3]
+    raise ValueError(f"unsupported scope decision: {decision}")
+
+
+def _validate_scope_transition(progress: dict, selected_priority_scope: str, skipped_priority_tiers: list[int]) -> None:
+    allowed_tiers = set(SCOPE_ALLOWED_TIERS[selected_priority_scope])
+    allowed_tiers.difference_update(skipped_priority_tiers)
+    blocked_in_progress_tiers = sorted(
+        {
+            item.get("priority_tier")
+            for item in progress["items"]
+            if item["status"] == STATUS_IN_PROGRESS and item.get("priority_tier") not in allowed_tiers
+        }
+    )
+    if blocked_in_progress_tiers:
+        joined = ", ".join(str(tier) for tier in blocked_in_progress_tiers if tier is not None)
+        raise ValueError(f"cannot narrow scope below active in-progress tiers: {joined}")
 
 
 def _build_fingerprint_record(path: Path, rel_path: str) -> dict:

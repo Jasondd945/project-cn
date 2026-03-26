@@ -41,7 +41,7 @@ def build_report(manifest: dict, progress: dict | None = None, originals_lock: d
                 }
             )
 
-        if category in job_state.LLM_CATEGORIES:
+        if job_state.should_expect_cn_file(progress, item):
             if cn_file and Path(cn_file).exists():
                 generated[f"{category}_cn_files"] += 1
             else:

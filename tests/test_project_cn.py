@@ -75,6 +75,42 @@ class ProjectCnTests(unittest.TestCase):
             self.assertEqual(items[-1]["batch_index"], 30)
             self.assertEqual(result["summary"]["llm_batch_count"], 30)
 
+    def test_assess_project_assigns_priority_tiers_and_orders_core_files_first(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs" / "plans").mkdir(parents=True)
+            (src_root / "src").mkdir(parents=True)
+            (src_root / "tests").mkdir(parents=True)
+
+            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (src_root / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+            (src_root / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            (src_root / "docs" / "plans" / "migration-plan.md").write_text("# Plan\n", encoding="utf-8")
+            (src_root / "tests" / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+            result = planning.assess_project(src_root)
+            items = {item["rel_path"]: item for item in result["items"]}
+            tier_summary = result["summary"]["priority_tiers"]
+            ordered_paths = [item["rel_path"] for item in result["items"]]
+
+            self.assertEqual(items["README.md"]["priority_tier"], 1)
+            self.assertEqual(items["src/app.py"]["priority_tier"], 1)
+            self.assertEqual(items["package.json"]["priority_tier"], 1)
+            self.assertEqual(items["docs/guide.md"]["priority_tier"], 2)
+            self.assertEqual(items["docs/plans/migration-plan.md"]["priority_tier"], 3)
+            self.assertEqual(items["tests/test_app.py"]["priority_tier"], 3)
+
+            self.assertEqual(tier_summary["tier_1"]["document_files"], 1)
+            self.assertEqual(tier_summary["tier_1"]["code_files"], 1)
+            self.assertEqual(tier_summary["tier_1"]["other_files"], 1)
+            self.assertEqual(tier_summary["tier_2"]["document_files"], 1)
+            self.assertEqual(tier_summary["tier_3"]["document_files"], 1)
+            self.assertEqual(tier_summary["tier_3"]["code_files"], 1)
+
+            self.assertLess(ordered_paths.index("README.md"), ordered_paths.index("docs/guide.md"))
+            self.assertLess(ordered_paths.index("docs/guide.md"), ordered_paths.index("tests/test_app.py"))
+
     def test_prepare_project_copy_replaces_existing_destination_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_root = Path(tmpdir) / "demo"
@@ -155,6 +191,52 @@ class ProjectCnTests(unittest.TestCase):
 
             self.assertTrue(result["summary"]["requires_confirmation"])
             self.assertTrue(result["summary"]["risk_flags"])
+
+    def test_large_noise_heavy_project_recommends_priority_tier_decision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "tests").mkdir(parents=True)
+            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+
+            for index in range(45):
+                (src_root / "tests" / f"test_{index:02d}.py").write_text(
+                    "def test_ok():\n    assert True\n",
+                    encoding="utf-8",
+                )
+
+            result = planning.assess_project(src_root)
+            summary = result["summary"]
+
+            self.assertTrue(summary["priority_tier_decision_recommended"])
+            self.assertEqual(summary["priority_tier_recommended_scope"], "tier_1_and_2")
+            self.assertIn("priority-tier-review-recommended", summary["risk_flags"])
+            self.assertTrue(summary["requires_confirmation"])
+
+    def test_start_job_defaults_large_projects_to_tier_1_scope(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "src").mkdir(parents=True)
+            (src_root / "tests").mkdir(parents=True)
+
+            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (src_root / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            for index in range(45):
+                (src_root / "tests" / f"test_{index:02d}.py").write_text(
+                    "def test_ok():\n    assert True\n",
+                    encoding="utf-8",
+                )
+
+            job = job_runner.start_job(src_root)
+            progress = job_state.load_json(Path(job["job_dir"]) / job_state.PROGRESS_FILE)
+            batch_paths = {item["rel_path"] for item in job["next_batch"]["items"]}
+
+            self.assertEqual(progress["selected_priority_scope"], job_state.SCOPE_TIER_1_ONLY)
+            self.assertTrue(progress["scope_decision_recommended"])
+            self.assertEqual(progress["next_locked_tier"], 2)
+            self.assertFalse(progress["awaiting_scope_decision"])
+            self.assertEqual(batch_paths, {"README.md", "src/app.py"})
 
     def test_assess_project_excludes_default_noise_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -269,6 +351,31 @@ class ProjectCnTests(unittest.TestCase):
             self.assertEqual(status["current_batch"]["batch_index"], 1)
             self.assertEqual(status["refresh_checkpoint_count"], 1)
 
+    def test_status_reports_scope_gate_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "src").mkdir(parents=True)
+            (src_root / "tests").mkdir(parents=True)
+
+            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (src_root / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            for index in range(45):
+                (src_root / "tests" / f"test_{index:02d}.py").write_text(
+                    "def test_ok():\n    assert True\n",
+                    encoding="utf-8",
+                )
+
+            job = job_runner.start_job(src_root)
+            status = job_runner.get_job_status(job["dst_root"])
+
+            self.assertEqual(status["selected_priority_scope"], job_state.SCOPE_TIER_1_ONLY)
+            self.assertEqual(status["next_locked_tier"], 2)
+            self.assertFalse(status["awaiting_scope_decision"])
+            self.assertEqual(status["next_action"], "finish_current_batch")
+            self.assertIn("tier_2", status["remaining_priority_tiers"])
+
     def test_mark_updates_progress_after_each_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_root = Path(tmpdir) / "demo"
@@ -333,6 +440,99 @@ class ProjectCnTests(unittest.TestCase):
             self.assertEqual(resumed["next_batch"]["status"], "complete")
             self.assertEqual(resumed["summary"]["pending_llm_files"], 0)
 
+    def test_resume_waits_for_scope_decision_after_tier_1_finishes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "src").mkdir(parents=True)
+            (src_root / "tests").mkdir(parents=True)
+
+            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (src_root / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            for index in range(45):
+                (src_root / "tests" / f"test_{index:02d}.py").write_text(
+                    "def test_ok():\n    assert True\n",
+                    encoding="utf-8",
+                )
+
+            job = job_runner.start_job(src_root)
+            for item in job["next_batch"]["items"]:
+                Path(item["cn_file"]).write_text("generated\n", encoding="utf-8")
+                job_runner.mark_job_file(job["dst_root"], item["file_id"], status="completed")
+
+            resumed = job_runner.resume_job(job["dst_root"])
+
+            self.assertEqual(resumed["next_batch"]["status"], "awaiting_scope_decision")
+            self.assertTrue(resumed["summary"]["awaiting_scope_decision"])
+            self.assertEqual(resumed["summary"]["next_locked_tier"], 2)
+            self.assertEqual(resumed["summary"]["next_action"], "ask_user_about_tier_2")
+
+    def test_scope_decision_unlocks_tier_2_after_tier_1(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "src").mkdir(parents=True)
+            (src_root / "tests").mkdir(parents=True)
+
+            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (src_root / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            for index in range(45):
+                (src_root / "tests" / f"test_{index:02d}.py").write_text(
+                    "def test_ok():\n    assert True\n",
+                    encoding="utf-8",
+                )
+
+            job = job_runner.start_job(src_root)
+            for item in job["next_batch"]["items"]:
+                Path(item["cn_file"]).write_text("generated\n", encoding="utf-8")
+                job_runner.mark_job_file(job["dst_root"], item["file_id"], status="completed")
+
+            decision = job_runner.decide_job_scope(job["dst_root"], job_state.SCOPE_TIER_1_AND_2)
+            resumed = job_runner.resume_job(job["dst_root"])
+
+            self.assertEqual(decision["selected_priority_scope"], job_state.SCOPE_TIER_1_AND_2)
+            self.assertFalse(decision["summary"]["awaiting_scope_decision"])
+            self.assertEqual(resumed["next_batch"]["status"], "ready")
+            self.assertEqual({item["rel_path"] for item in resumed["next_batch"]["items"]}, {"docs/guide.md"})
+            self.assertEqual(resumed["summary"]["next_locked_tier"], 3)
+
+    def test_skip_tier_3_keeps_report_complete_without_missing_cn_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "src").mkdir(parents=True)
+            (src_root / "tests").mkdir(parents=True)
+
+            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (src_root / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            for index in range(45):
+                (src_root / "tests" / f"test_{index:02d}.py").write_text(
+                    "def test_ok():\n    assert True\n",
+                    encoding="utf-8",
+                )
+
+            job = job_runner.start_job(src_root)
+            for item in job["next_batch"]["items"]:
+                Path(item["cn_file"]).write_text("generated\n", encoding="utf-8")
+                job_runner.mark_job_file(job["dst_root"], item["file_id"], status="completed")
+
+            job_runner.decide_job_scope(job["dst_root"], job_state.SCOPE_TIER_1_AND_2)
+            resumed = job_runner.resume_job(job["dst_root"])
+            for item in resumed["next_batch"]["items"]:
+                Path(item["cn_file"]).write_text("generated\n", encoding="utf-8")
+                job_runner.mark_job_file(job["dst_root"], item["file_id"], status="completed")
+
+            job_runner.decide_job_scope(job["dst_root"], job_state.SCOPE_DECISION_SKIP_TIER_3)
+            report = job_runner.build_job_report(job["dst_root"])
+
+            self.assertEqual(report["status"], "complete_with_skipped_tiers")
+            self.assertEqual(report["skipped_priority_tiers"], [3])
+            self.assertEqual(report["missing_cn_files"], [])
+            self.assertFalse(report["awaiting_scope_decision"])
+
     def test_report_flags_modified_source_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_root = Path(tmpdir) / "demo"
@@ -388,6 +588,9 @@ class ProjectCnTests(unittest.TestCase):
             self.assertTrue((output_dir / job_state.TEXT_REPORT_FILE).exists())
             self.assertIn("=== 项目翻译结果报告 ===", final_report_text)
             self.assertIn("工作量摘要：", final_report_text)
+            self.assertIn("优先级分档：", final_report_text)
+            self.assertIn("范围闸门：", final_report_text)
+            self.assertIn("1 档 核心理解层", final_report_text)
             self.assertIn("进度摘要：", final_report_text)
             self.assertIn("原文件保护：", final_report_text)
 
@@ -470,6 +673,16 @@ class ProjectCnTests(unittest.TestCase):
             "resume",
             "status",
             "mark",
+            "scope",
+            "1 档",
+            "2 档",
+            "3 档",
+            "priority_tiers",
+            "priority_tier_decision_recommended",
+            "priority_tier_recommended_scope",
+            "默认自动开始 `1 档`",
+            "`1 档` 完成后必须暂停并问用户是否进入 `2 档`",
+            "用户选择必须通过状态命令写入作业文件",
             "每 20 个文件强制刷新",
             "不得改 copied_file",
             "不得改源目录",

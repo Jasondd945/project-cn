@@ -5,7 +5,7 @@ import os
 import shutil
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 sys.dont_write_bytecode = True
 
@@ -19,6 +19,170 @@ SINGLE_FILE_RISK_CHARS = 120000
 TOTAL_LLM_FILES_RISK = 200
 TOTAL_ROUNDS_RISK = 120
 TOTAL_INPUT_TOKENS_RISK = 400000
+TOTAL_FILES_TIER_DIALOG_RISK = 150
+TIER_3_FILES_RISK = 40
+TIER_3_LLM_FILES_RISK = 20
+
+PRIORITY_TIER_LABELS = {
+    1: "核心理解层",
+    2: "重要扩展层",
+    3: "外围噪声层",
+}
+
+CATEGORY_SORT_ORDER = {
+    "document": 0,
+    "code": 1,
+    "other": 2,
+}
+
+ROOT_CORE_DOC_NAMES = {
+    "readme",
+    "changelog",
+    "contributing",
+    "license",
+    "install",
+    "installation",
+    "quickstart",
+    "quick-start",
+    "getting-started",
+    "overview",
+}
+
+CORE_DOC_HINTS = {
+    "readme",
+    "index",
+    "overview",
+    "getting-started",
+    "quickstart",
+    "quick-start",
+    "architecture",
+    "api",
+}
+
+CORE_CODE_DIRS = {
+    "src",
+    "app",
+    "api",
+    "server",
+    "client",
+    "frontend",
+    "backend",
+    "core",
+    "lib",
+    "cmd",
+}
+
+CORE_CODE_STEMS = {
+    "main",
+    "app",
+    "server",
+    "client",
+    "index",
+    "api",
+    "router",
+    "routes",
+    "entry",
+}
+
+IMPORTANT_DOC_DIRS = {
+    "docs",
+    "doc",
+    "guide",
+    "guides",
+    "manual",
+    "manuals",
+    "reference",
+    "references",
+    "wiki",
+}
+
+IMPORTANT_CODE_DIRS = {
+    "scripts",
+    "script",
+    "tools",
+    "tool",
+    "bin",
+    "cli",
+    "internal",
+    "pkg",
+    "modules",
+    "components",
+    "services",
+    "controllers",
+    "handlers",
+}
+
+LOW_PRIORITY_DIRS = {
+    "test",
+    "tests",
+    "__tests__",
+    "spec",
+    "specs",
+    "fixtures",
+    "fixture",
+    "mocks",
+    "mock",
+    "example",
+    "examples",
+    "demo",
+    "demos",
+    "sample",
+    "samples",
+    "bench",
+    "benches",
+    "benchmark",
+    "benchmarks",
+    "coverage",
+    "history",
+    "archive",
+    "archives",
+    "legacy",
+    "deprecated",
+    "plans",
+    "plan",
+    "draft",
+    "drafts",
+    "tmp",
+    "temp",
+}
+
+LOW_PRIORITY_DOC_HINTS = {
+    "plan",
+    "plans",
+    "roadmap",
+    "todo",
+    "backlog",
+    "notes",
+    "meeting",
+    "draft",
+    "archive",
+    "history",
+    "retro",
+    "retrospective",
+}
+
+ROOT_CORE_OTHER_FILENAMES = {
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "poetry.lock",
+    "pipfile",
+    "pipfile.lock",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+    "cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "composer.json",
+    "gemfile",
+    "dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    ".env.example",
+}
 
 DEFAULT_EXCLUDED_DIR_NAMES = {
     ".git",
@@ -60,15 +224,11 @@ def assess_project(
     dst_path = build_destination_root(src_path, dst_root)
     excluded_dir_names = _build_excluded_dir_names(exclude_dirs)
     skipped_dir_names: set[str] = set()
-    items = []
+    raw_items = []
     summary = _empty_summary(batch_size)
     _set_root_summary(summary, src_path)
 
-    sequence_index = 0
-    llm_sequence = 0
-
     for file_path in _iter_files(src_path, excluded_dir_names, skipped_dir_names):
-        sequence_index += 1
         rel_path = file_path.relative_to(src_path).as_posix()
         category = classify_file(file_path)
         metrics = collect_text_metrics(file_path)
@@ -76,22 +236,18 @@ def assess_project(
         estimated_rounds = _estimate_rounds(metrics["estimated_chars"], category)
         estimated_input_tokens = estimate_input_tokens(metrics["estimated_chars"])
         token_low, token_high = _estimate_total_token_range(category, estimated_input_tokens)
-
-        batch_index = None
-        if category in LLM_CATEGORIES:
-            llm_sequence += 1
-            batch_index = math.ceil(llm_sequence / batch_size)
+        priority_tier, priority_reason = _classify_priority_tier(rel_path, category)
 
         item = {
-            "file_id": f"F{sequence_index:06d}",
-            "sequence_index": sequence_index,
             "rel_path": rel_path,
             "src_file": str(file_path),
             "category": category,
             "copied_rel_path": rel_path,
             "cn_rel_path": cn_rel_path,
             "llm_action": _llm_action(category),
-            "batch_index": batch_index,
+            "priority_tier": priority_tier,
+            "priority_tier_label": PRIORITY_TIER_LABELS[priority_tier],
+            "priority_reason": priority_reason,
             "size_bytes": metrics["size_bytes"],
             "estimated_chars": metrics["estimated_chars"],
             "estimated_input_tokens": estimated_input_tokens,
@@ -102,6 +258,22 @@ def assess_project(
             "read_error": metrics["read_error"],
             "sample_based": metrics["sample_based"],
         }
+        raw_items.append(item)
+
+    raw_items.sort(key=_item_sort_key)
+
+    items = []
+    sequence_index = 0
+    llm_sequence = 0
+    for item in raw_items:
+        sequence_index += 1
+        item["sequence_index"] = sequence_index
+        item["file_id"] = f"F{sequence_index:06d}"
+        item["batch_index"] = None
+        if item["category"] in LLM_CATEGORIES:
+            llm_sequence += 1
+            item["batch_index"] = math.ceil(llm_sequence / batch_size)
+
         items.append(item)
         _update_summary(summary, item)
 
@@ -251,6 +423,19 @@ def _empty_summary(batch_size: int) -> dict:
         "requires_confirmation": False,
         "largest_llm_file_chars": 0,
         "excluded_dirs": [],
+        "priority_tiers": {
+            "tier_1": _empty_tier_summary(1),
+            "tier_2": _empty_tier_summary(2),
+            "tier_3": _empty_tier_summary(3),
+        },
+        "priority_tier_decision_recommended": False,
+        "priority_tier_recommended_scope": "all_tiers",
+        "priority_tier_decision_options": [
+            "tier_1_only",
+            "tier_1_and_2",
+            "all_tiers",
+            "skip_tier_3",
+        ],
     }
 
 
@@ -272,6 +457,15 @@ def _set_root_summary(summary: dict, src_path: Path) -> None:
 def _update_summary(summary: dict, item: dict) -> None:
     summary["total_files"] += 1
     summary[f"{item['category']}_files"] += 1
+
+    tier_key = f"tier_{item['priority_tier']}"
+    tier_summary = summary["priority_tiers"][tier_key]
+    tier_summary["total_files"] += 1
+    tier_summary[f"{item['category']}_files"] += 1
+    if item["category"] in LLM_CATEGORIES:
+        tier_summary["llm_files"] += 1
+    if len(tier_summary["example_paths"]) < 5:
+        tier_summary["example_paths"].append(item["rel_path"])
 
     if item["category"] in LLM_CATEGORIES:
         summary["llm_files"] += 1
@@ -325,7 +519,13 @@ def _finalize_summary(summary: dict) -> None:
     if summary["undecodable_files"]:
         risk_flags.append("undecodable-llm-files-detected")
 
+    tier_decision_recommended = _should_recommend_tier_decision(summary)
+    if tier_decision_recommended:
+        risk_flags.append("priority-tier-review-recommended")
+
     summary["risk_flags"] = risk_flags
+    summary["priority_tier_decision_recommended"] = tier_decision_recommended
+    summary["priority_tier_recommended_scope"] = _recommended_tier_scope(summary)
     summary["requires_confirmation"] = bool(risk_flags)
 
 
@@ -338,6 +538,115 @@ def _build_excluded_dir_names(exclude_dirs: list[str] | None) -> set[str]:
     if exclude_dirs:
         merged.update(name.lower() for name in exclude_dirs if name)
     return merged
+
+
+def _empty_tier_summary(tier: int) -> dict:
+    return {
+        "tier": tier,
+        "label": PRIORITY_TIER_LABELS[tier],
+        "total_files": 0,
+        "document_files": 0,
+        "code_files": 0,
+        "other_files": 0,
+        "llm_files": 0,
+        "example_paths": [],
+    }
+
+
+def _item_sort_key(item: dict) -> tuple[int, int, str]:
+    return (
+        item["priority_tier"],
+        CATEGORY_SORT_ORDER.get(item["category"], 99),
+        item["rel_path"].lower(),
+    )
+
+
+def _classify_priority_tier(rel_path: str, category: str) -> tuple[int, str]:
+    pure_path = PurePosixPath(rel_path)
+    parts = [part.lower() for part in pure_path.parts]
+    filename = parts[-1]
+    stem = pure_path.stem.lower()
+    parent_dirs = parts[:-1]
+    depth = len(parts) - 1
+
+    matched_low_dir = next((part for part in parent_dirs if part in LOW_PRIORITY_DIRS), None)
+    if matched_low_dir:
+        return 3, f"位于低优先级目录 `{matched_low_dir}`"
+
+    if _is_test_like_filename(filename, stem):
+        return 3, "测试或规格文件"
+
+    if category == "document":
+        normalized_doc_name = _normalized_doc_name(filename)
+        if depth == 0 and normalized_doc_name in ROOT_CORE_DOC_NAMES:
+            return 1, "顶层核心项目文档"
+        if parent_dirs[:1] and parent_dirs[0] in {"docs", "doc"} and stem in CORE_DOC_HINTS and depth <= 2:
+            return 1, "核心项目说明文档"
+        if stem in LOW_PRIORITY_DOC_HINTS:
+            return 3, "历史计划或低优先级说明文档"
+        if any(part in IMPORTANT_DOC_DIRS for part in parent_dirs) or depth <= 1:
+            return 2, "重要说明文档"
+
+    if category == "code":
+        if depth == 0 and stem in CORE_CODE_STEMS:
+            return 1, "顶层核心入口脚本"
+        if any(part in {"api", "router", "routes"} for part in parent_dirs):
+            return 1, "核心接口或路由代码"
+        if parent_dirs[:1] and parent_dirs[0] in CORE_CODE_DIRS and (depth == 1 or stem in CORE_CODE_STEMS):
+            return 1, "核心前后端入口代码"
+        if any(part in IMPORTANT_CODE_DIRS for part in parent_dirs) or any(part in CORE_CODE_DIRS for part in parent_dirs):
+            return 2, "重要支撑代码"
+
+    if category == "other":
+        if depth == 0 and filename in ROOT_CORE_OTHER_FILENAMES:
+            return 1, "核心项目配置或依赖清单"
+        if depth == 0:
+            return 2, "顶层辅助文件"
+
+    return 2, "默认归入重要扩展层"
+
+
+def _normalized_doc_name(filename: str) -> str:
+    pure_path = PurePosixPath(filename)
+    stem = pure_path.stem.lower()
+    if stem:
+        return stem
+    return filename.lower()
+
+
+def _is_test_like_filename(filename: str, stem: str) -> bool:
+    if stem.startswith("test_") or stem.endswith("_test"):
+        return True
+    if stem.startswith("spec_") or stem.endswith("_spec"):
+        return True
+    if ".test." in filename or ".spec." in filename:
+        return True
+    return False
+
+
+def _should_recommend_tier_decision(summary: dict) -> bool:
+    tier_3 = summary["priority_tiers"]["tier_3"]
+    if summary["total_files"] >= TOTAL_FILES_TIER_DIALOG_RISK:
+        return True
+    if tier_3["total_files"] >= TIER_3_FILES_RISK:
+        return True
+    if tier_3["llm_files"] >= TIER_3_LLM_FILES_RISK:
+        return True
+    return False
+
+
+def _recommended_tier_scope(summary: dict) -> str:
+    tier_3 = summary["priority_tiers"]["tier_3"]
+    if summary["total_files"] >= 800 or summary["llm_files"] >= 500:
+        return "tier_1_only"
+    if (
+        tier_3["total_files"] >= TIER_3_FILES_RISK
+        or tier_3["llm_files"] >= TIER_3_LLM_FILES_RISK
+        or summary["total_files"] >= 300
+        or summary["llm_files"] >= 200
+    ):
+        return "tier_1_and_2"
+    return "all_tiers"
 
 
 def _iter_files(src_root: Path, excluded_dir_names: set[str], skipped_dir_names: set[str]):

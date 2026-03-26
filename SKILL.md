@@ -166,10 +166,21 @@ C:\work\A-CN\AAA-translate-output
 
 - 超大项目必须走 `manifest + progress` 双文件驱动，不能只靠上下文记忆。
 - `translate-manifest.json` 是稳定任务索引，负责给每个文件分配 `file_id` 和批次。
+- `translate-manifest.json` 还必须为每个文件分配 `priority_tier`，先把全项目抽象成 1 档、2 档、3 档，再决定处理范围。
 - `translate-progress.json` 是动态进度账本，负责记录 `pending`、`in_progress`、`completed`、`failed`、`skipped`。
+- 大项目评估时，必须先理解整个目录，再按“档位 + 文件类型”汇总，而不是直接扎进某个子目录开做。
 - 禁止靠记忆判断哪些文件已经处理过，哪些还没处理。
 - 禁止未读取 `translate-progress.json` 就继续下一批。
 - 下一批文件只能从进度账本里取，不能靠“我记得上次处理到哪了”。
+- 1 档、2 档、3 档内部都要继续区分 `document`、`code`、`other`，不能只按目录粗暴划分。
+- 1 档是“核心理解层”，优先放 README、CHANGELOG、CONTRIBUTING、LICENSE、核心 API、前后端入口脚本、核心依赖清单等。
+- 2 档是“重要扩展层”，优先放 docs 目录中的重要说明、指南、参考文档、重要支撑代码和工具脚本。
+- 3 档是“外围噪声层”，优先放 tests、fixtures、examples、历史 plan 文档、archive、legacy、draft 等低优先级内容。
+- 默认自动开始 `1 档`。
+- `1 档` 完成后必须暂停并问用户是否进入 `2 档`。
+- `2 档` 完成后必须暂停并问用户是否进入 `3 档`。
+- 用户选择必须通过状态命令写入作业文件，不能只靠聊天记忆。
+- 对于超大型项目，agent 不得默认从 3 档开始，也不得在未经确认的情况下直接把 1/2/3 档全部跑完。
 - 默认每 20 个文件强制刷新一次规则文件，并重新读取 `SKILL.md`、`references/document-rules.md`、`references/code-rules.md`、`translate-progress.json`、`translate-manifest.json`。
 - 默认按批次顺序推进，不默认并行；多子智能体并行只作为可选模式。
 - 如果启用多子智能体，所有子智能体必须共享同一个 `AAA-translate-output` 状态目录。
@@ -184,11 +195,15 @@ C:\work\A-CN\AAA-translate-output
 推荐大项目执行顺序：
 
 1. `start` 生成 `translate-manifest.json`、`translate-progress.json`、`translate-originals-lock.json`
-2. 读取首批文件清单并处理
-3. 每处理完一个文件就更新一次进度账本
-4. 每满 20 个文件强制刷新一次 skill 规则
-5. 如中断，使用 `resume`
-6. 全部处理后，使用 `report`
+2. 先读取 `summary.priority_tiers`
+3. 先向用户汇报 1 档、2 档、3 档的文件量，以及每档里的 `document`、`code`、`other`
+4. 如果 `priority_tier_decision_recommended = true`，默认自动开始 `1 档`
+5. `1 档` 完成后，必须暂停并让用户决定是否放开 `2 档`
+6. `2 档` 完成后，必须暂停并让用户决定是否放开 `3 档`
+7. 每处理完一个文件就更新一次进度账本
+8. 每满 20 个文件强制刷新一次 skill 规则
+9. 如中断，使用 `resume`
+10. 全部处理后，使用 `report`
 
 ## 标准流程
 
@@ -244,18 +259,25 @@ python "<skill_dir>\scripts\job_runner.py" start "<src_root>"
 - `risk_flags`
 - `requires_confirmation`
 - `excluded_dirs`
+- `priority_tiers`
+- `priority_tier_decision_recommended`
+- `priority_tier_recommended_scope`
 
 ### 3. 判断是否需要先提醒用户
 
-仅当 `requires_confirmation = true` 时，才先告诉用户：
+当 `requires_confirmation = true` 或 `priority_tier_decision_recommended = true` 时，必须先告诉用户：
 
 - 为什么这是超大任务。
 - 预计总耗时范围。
 - 预计 token 范围。
 - 风险点是什么。
-- 推荐继续整项目执行，还是让用户明确批准分批策略。
+- 1 档、2 档、3 档各有多少文件。
+- 每档中的 `document`、`code`、`other` 各有多少。
+- 推荐范围是 `priority_tier_recommended_scope` 指向的哪一档组合。
+- 如果只是“档位闸门建议”，默认先跑 `1 档`，不要在一开始就默认放开 `2/3 档`。
+- 当 `1 档` 跑完后，再让用户明确选择：`只做 1 档`、`先做 1+2 档`、`全部 1+2+3 档`、或显式跳过 `3 档`。
 
-如果 `requires_confirmation = false`，直接继续，不要额外拖延。
+如果 `requires_confirmation = false` 且 `priority_tier_decision_recommended = false`，直接继续，不要额外拖延。
 
 ### 4. 启动作业并复制目录
 
@@ -304,6 +326,14 @@ python "<skill_dir>\scripts\job_runner.py" status "<A-CN>"
 python "<skill_dir>\scripts\job_runner.py" resume "<A-CN>"
 ```
 
+用户决定是否放开下一档，必须使用：
+
+```powershell
+python "<skill_dir>\scripts\job_runner.py" scope "<A-CN>" --decision tier_1_and_2
+python "<skill_dir>\scripts\job_runner.py" scope "<A-CN>" --decision all_tiers
+python "<skill_dir>\scripts\job_runner.py" scope "<A-CN>" --decision skip_tier_3
+```
+
 每处理完一个 `file_id` 对应的文件后，必须立刻写回状态：
 
 ```powershell
@@ -319,7 +349,7 @@ python "<skill_dir>\scripts\job_runner.py" mark "<A-CN>" "<file_id>" --status fa
 硬约束：
 
 - 不允许口头记忆“处理到哪里了”，只能以 `translate-progress.json` 为准。
-- `status` 用来读状态，`resume` 用来取下一批，`mark` 用来逐文件落盘；三者缺一不可。
+- `status` 用来读状态，`resume` 用来取下一批，`scope` 用来写用户档位决定，`mark` 用来逐文件落盘；四者缺一不可。
 - 若启用多子智能体，主 agent 也必须要求每个子智能体按 `file_id` 回报完成状态，再统一调用 `mark` 回写。
 
 ### 6. 逐个处理文档文件

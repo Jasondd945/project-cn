@@ -63,6 +63,7 @@ def start_job(
         "summary": manifest["summary"],
         "progress_summary": progress["summary"],
         "batch_size": batch_size,
+        "selected_priority_scope": progress["summary"].get("selected_priority_scope"),
         "created_at": _utc_timestamp(),
     }
     job_state.atomic_write_json(job_dir / job_state.JOB_INFO_FILE, job_info)
@@ -86,6 +87,21 @@ def resume_job(job_ref: str | Path, retry_failed: bool = False) -> dict:
         "progress_path": str(job_dir / job_state.PROGRESS_FILE),
         "summary": progress["summary"],
         "next_batch": batch,
+    }
+
+
+def decide_job_scope(job_ref: str | Path, decision: str) -> dict:
+    job_dir = job_state.resolve_job_dir(job_ref)
+    progress = job_state.load_json(job_dir / job_state.PROGRESS_FILE)
+    result = job_state.set_scope_decision(progress, decision)
+    job_state.atomic_write_json(job_dir / job_state.PROGRESS_FILE, progress)
+    job_info = job_state.load_json_if_exists(job_dir / job_state.JOB_INFO_FILE)
+
+    return {
+        "job_id": job_info.get("job_id", job_dir.name),
+        "job_dir": str(job_dir),
+        "progress_path": str(job_dir / job_state.PROGRESS_FILE),
+        **result,
     }
 
 
@@ -114,6 +130,11 @@ def get_job_status(job_ref: str | Path) -> dict:
         "current_batch": current_batch,
         "next_pending_batch_index": progress["summary"].get("next_pending_batch_index"),
         "refresh_checkpoint_count": progress["summary"].get("refresh_checkpoint_count", 0),
+        "selected_priority_scope": progress["summary"].get("selected_priority_scope"),
+        "next_locked_tier": progress["summary"].get("next_locked_tier"),
+        "awaiting_scope_decision": progress["summary"].get("awaiting_scope_decision", False),
+        "next_action": progress["summary"].get("next_action"),
+        "remaining_priority_tiers": progress["summary"].get("remaining_priority_tiers", {}),
     }
 
 
@@ -148,20 +169,24 @@ def build_job_report(job_ref: str | Path) -> dict:
         originals_lock=originals_lock,
     )
     progress_summary = verify_report["progress_summary"]
-    unfinished_work = (
-        progress_summary.get("pending_llm_files", 0) > 0
-        or progress_summary.get("in_progress_llm_files", 0) > 0
-        or progress_summary.get("failed_llm_files", 0) > 0
+    unfinished_in_scope = (
+        progress_summary.get("pending_llm_files_in_scope", 0) > 0
+        or progress_summary.get("in_progress_llm_files_in_scope", 0) > 0
+        or progress_summary.get("failed_llm_files_in_scope", 0) > 0
     )
     status = "ok"
     if (
         verify_report["missing_original_copies"]
-        or verify_report["missing_cn_files"]
         or verify_report["modified_source_files"]
         or verify_report["modified_original_copies"]
-        or unfinished_work
+        or verify_report["missing_cn_files"]
+        or unfinished_in_scope
     ):
         status = "incomplete"
+    elif progress_summary.get("awaiting_scope_decision", False):
+        status = "awaiting_scope_decision"
+    elif progress_summary.get("skipped_priority_tiers"):
+        status = "complete_with_skipped_tiers"
 
     final_report = {
         "job_id": job_info.get("job_id", job_dir.name),
@@ -177,6 +202,14 @@ def build_job_report(job_ref: str | Path) -> dict:
         "modified_original_copies": verify_report["modified_original_copies"],
         "source_integrity_ok": verify_report["source_integrity_ok"],
         "copied_original_integrity_ok": verify_report["copied_original_integrity_ok"],
+        "selected_priority_scope": progress_summary.get("selected_priority_scope"),
+        "selected_priority_scope_label": progress_summary.get("selected_priority_scope_label"),
+        "scope_finalized": progress_summary.get("scope_finalized", False),
+        "skipped_priority_tiers": progress_summary.get("skipped_priority_tiers", []),
+        "awaiting_scope_decision": progress_summary.get("awaiting_scope_decision", False),
+        "next_locked_tier": progress_summary.get("next_locked_tier"),
+        "next_action": progress_summary.get("next_action"),
+        "remaining_priority_tiers": progress_summary.get("remaining_priority_tiers", {}),
         "status": status,
         "reported_at": _utc_timestamp(),
     }
@@ -190,6 +223,7 @@ def _format_text_report(report: dict) -> str:
     summary = report["summary"]
     progress_summary = report["progress_summary"]
     generated = report["generated"]
+    priority_tiers = summary.get("priority_tiers", {})
     root_mode = (
         "严格使用用户给定路径"
         if summary.get("root_interpretation", "exact-user-path") == "exact-user-path"
@@ -199,9 +233,27 @@ def _format_text_report(report: dict) -> str:
     status_text = {
         "ok": "完成",
         "incomplete": "未完成",
+        "awaiting_scope_decision": "等待用户决定下一档",
+        "complete_with_skipped_tiers": "已完成（含用户跳过档位）",
     }.get(report["status"], report["status"])
     source_integrity = "通过" if report["source_integrity_ok"] else "失败"
     copied_integrity = "通过" if report["copied_original_integrity_ok"] else "失败"
+    tier_decision = "是" if summary.get("priority_tier_decision_recommended") else "否"
+    recommended_scope = {
+        "tier_1_only": "仅 1 档",
+        "tier_1_and_2": "1 档 + 2 档",
+        "all_tiers": "全部 1 + 2 + 3 档",
+    }.get(summary.get("priority_tier_recommended_scope"), summary.get("priority_tier_recommended_scope"))
+    selected_scope = report.get("selected_priority_scope_label") or progress_summary.get("selected_priority_scope_label")
+    skipped_tiers = report.get("skipped_priority_tiers", [])
+    skipped_tiers_text = "无" if not skipped_tiers else "、".join(f"{tier} 档" for tier in skipped_tiers)
+    awaiting_text = "是" if report.get("awaiting_scope_decision", False) else "否"
+    scope_finalized_text = "是" if report.get("scope_finalized", False) else "否"
+    next_locked_tier_text = (
+        f"{report['next_locked_tier']} 档" if report.get("next_locked_tier") is not None else "无"
+    )
+    next_action_text = _format_next_action(report.get("next_action"))
+    remaining_priority_tiers = report.get("remaining_priority_tiers", {})
 
     lines = [
         "=== 项目翻译结果报告 ===",
@@ -226,12 +278,32 @@ def _format_text_report(report: dict) -> str:
         f"- 预计输入 token：{summary.get('estimated_input_tokens', 0)}",
         f"- 预计总 token 范围：{summary.get('estimated_tokens_low', 0)}-{summary.get('estimated_tokens_high', 0)}",
         "",
+        "优先级分档：",
+        _format_tier_line("1 档 核心理解层", priority_tiers.get("tier_1")),
+        _format_tier_line("2 档 重要扩展层", priority_tiers.get("tier_2")),
+        _format_tier_line("3 档 外围噪声层", priority_tiers.get("tier_3")),
+        f"- 是否建议先按档位向用户确认：{tier_decision}",
+        f"- 推荐处理范围：{recommended_scope}",
+        "",
+        "范围闸门：",
+        f"- 当前选择范围：{selected_scope}",
+        f"- 是否已最终定档：{scope_finalized_text}",
+        f"- 是否等待用户决定下一档：{awaiting_text}",
+        f"- 已跳过档位：{skipped_tiers_text}",
+        f"- 下一待解锁档位：{next_locked_tier_text}",
+        f"- 下一建议动作：{next_action_text}",
+        _format_remaining_tier_line("1 档剩余", remaining_priority_tiers.get("tier_1")),
+        _format_remaining_tier_line("2 档剩余", remaining_priority_tiers.get("tier_2")),
+        _format_remaining_tier_line("3 档剩余", remaining_priority_tiers.get("tier_3")),
+        "",
         "进度摘要：",
         f"- 批次大小：{progress_summary.get('batch_size', 0)}",
         f"- 待处理 LLM 文件：{progress_summary.get('pending_llm_files', 0)}",
         f"- 进行中 LLM 文件：{progress_summary.get('in_progress_llm_files', 0)}",
         f"- 已完成 LLM 文件：{progress_summary.get('completed_llm_files', 0)}",
         f"- 失败 LLM 文件：{progress_summary.get('failed_llm_files', 0)}",
+        f"- 当前范围内待处理 LLM 文件：{progress_summary.get('pending_llm_files_in_scope', 0)}",
+        f"- 当前范围内失败 LLM 文件：{progress_summary.get('failed_llm_files_in_scope', 0)}",
         f"- 刷新检查点数：{progress_summary.get('refresh_checkpoint_count', 0)}",
         "",
         "产出结果：",
@@ -269,6 +341,41 @@ def _format_text_report(report: dict) -> str:
             lines.append(f"- {item['rel_path']} ({item['reason']})")
 
     return "\n".join(lines) + "\n"
+
+
+def _format_tier_line(label: str, tier_summary: dict | None) -> str:
+    if not tier_summary:
+        return f"- {label}：0 个文件"
+    return (
+        f"- {label}：{tier_summary.get('total_files', 0)} 个文件 "
+        f"(文档 {tier_summary.get('document_files', 0)} / "
+        f"代码 {tier_summary.get('code_files', 0)} / "
+        f"其他 {tier_summary.get('other_files', 0)})"
+    )
+
+
+def _format_remaining_tier_line(label: str, tier_summary: dict | None) -> str:
+    if not tier_summary:
+        return f"- {label}：0"
+    state = "已跳过" if tier_summary.get("skipped") else "已开放" if tier_summary.get("allowed") else "锁定"
+    return (
+        f"- {label}：{tier_summary.get('remaining_files', 0)} "
+        f"(文档 {tier_summary.get('remaining_document_files', 0)} / "
+        f"代码 {tier_summary.get('remaining_code_files', 0)} / "
+        f"其他 {tier_summary.get('remaining_other_files', 0)})，状态：{state}"
+    )
+
+
+def _format_next_action(next_action: str | None) -> str:
+    mapping = {
+        "finish_current_batch": "先完成当前批次",
+        "resume": "继续领取下一批",
+        "report": "生成最终报告",
+        "ask_user_about_tier_2": "向用户确认是否进入 2 档",
+        "ask_user_about_tier_3": "向用户确认是否进入 3 档",
+        "await_scope_decision": "等待用户做档位决定",
+    }
+    return mapping.get(next_action, next_action or "无")
 
 
 def _remove_stale_internal_outputs(job_dir: Path) -> None:
@@ -332,6 +439,18 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("job_ref", help="A-CN 目录、AAA-translate-output 目录，或其内部文件路径")
     resume_parser.add_argument("--retry-failed", action="store_true", help="没有 pending 文件时，允许重试 failed 文件")
 
+    scope_parser = subparsers.add_parser(
+        "scope",
+        help="把用户选定的档位范围写入 translate-progress.json。",
+    )
+    scope_parser.add_argument("job_ref", help="A-CN 目录、AAA-translate-output 目录，或其内部文件路径")
+    scope_parser.add_argument(
+        "--decision",
+        required=True,
+        choices=job_state.SCOPE_DECISION_OPTIONS,
+        help="档位范围决策：tier_1_only / tier_1_and_2 / all_tiers / skip_tier_3",
+    )
+
     mark_parser = subparsers.add_parser(
         "mark",
         help="处理完单个文件后，更新 translate-progress.json 中的状态。",
@@ -367,6 +486,8 @@ def main() -> int:
             payload = get_job_status(args.job_ref)
         elif args.command == "resume":
             payload = resume_job(args.job_ref, retry_failed=args.retry_failed)
+        elif args.command == "scope":
+            payload = decide_job_scope(args.job_ref, decision=args.decision)
         elif args.command == "mark":
             payload = mark_job_file(args.job_ref, args.file_id, status=args.status, error=args.error)
         else:
