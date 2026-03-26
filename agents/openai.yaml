@@ -1,4 +1,4 @@
 interface:
   display_name: "Project CN"
-  short_description: "复制项目为 A-CN，并生成文档与代码的 -CN 副本。"
-  default_prompt: "使用 $project-cn 把项目复制成同级 A-CN 中文镜像，保留原文件，并为文档生成 -CN 翻译副本、为代码生成 -CN 中文注释增强副本。"
+  short_description: "复制项目为 A-CN，并按批次生成文档与代码的 -CN 副本。"
+  default_prompt: "使用 $project-cn 把项目复制成同级 A-CN 中文镜像，保留原文件，并为文档生成 -CN 翻译副本、为代码生成 -CN 中文注释增强副本；大项目时按 manifest 和 progress 状态文件推进。"

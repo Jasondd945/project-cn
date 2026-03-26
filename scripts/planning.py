@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import shutil
@@ -11,6 +10,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from classification import build_cn_filename, classify_file
+from job_state import DEFAULT_BATCH_SIZE, LLM_CATEGORIES, atomic_write_json
 from text_metrics import collect_text_metrics, estimate_input_tokens
 
 
@@ -51,6 +51,7 @@ def assess_project(
     src_root: str | Path,
     dst_root: str | Path | None = None,
     exclude_dirs: list[str] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
     src_path = Path(src_root).expanduser().resolve()
     if not src_path.is_dir():
@@ -60,10 +61,14 @@ def assess_project(
     excluded_dir_names = _build_excluded_dir_names(exclude_dirs)
     skipped_dir_names: set[str] = set()
     items = []
-    summary = _empty_summary()
+    summary = _empty_summary(batch_size)
     _set_root_summary(summary, src_path)
 
+    sequence_index = 0
+    llm_sequence = 0
+
     for file_path in _iter_files(src_path, excluded_dir_names, skipped_dir_names):
+        sequence_index += 1
         rel_path = file_path.relative_to(src_path).as_posix()
         category = classify_file(file_path)
         metrics = collect_text_metrics(file_path)
@@ -72,13 +77,21 @@ def assess_project(
         estimated_input_tokens = estimate_input_tokens(metrics["estimated_chars"])
         token_low, token_high = _estimate_total_token_range(category, estimated_input_tokens)
 
+        batch_index = None
+        if category in LLM_CATEGORIES:
+            llm_sequence += 1
+            batch_index = math.ceil(llm_sequence / batch_size)
+
         item = {
+            "file_id": f"F{sequence_index:06d}",
+            "sequence_index": sequence_index,
             "rel_path": rel_path,
             "src_file": str(file_path),
             "category": category,
             "copied_rel_path": rel_path,
             "cn_rel_path": cn_rel_path,
             "llm_action": _llm_action(category),
+            "batch_index": batch_index,
             "size_bytes": metrics["size_bytes"],
             "estimated_chars": metrics["estimated_chars"],
             "estimated_input_tokens": estimated_input_tokens,
@@ -111,8 +124,14 @@ def prepare_project_copy(
     dst_root: str | Path | None = None,
     replace_existing: bool = True,
     exclude_dirs: list[str] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
-    manifest = assess_project(src_root, dst_root=dst_root, exclude_dirs=exclude_dirs)
+    manifest = assess_project(
+        src_root,
+        dst_root=dst_root,
+        exclude_dirs=exclude_dirs,
+        batch_size=batch_size,
+    )
     src_path = Path(manifest["src_root"])
     dst_path = Path(manifest["dst_root"])
     excluded_dir_names = set(manifest.get("excluded_dir_rules", []))
@@ -144,7 +163,13 @@ def prepare_project_copy(
             copied_files += 1
         except OSError as exc:
             item["copy_failure"] = str(exc)
-            copy_failures.append({"rel_path": item["rel_path"], "reason": str(exc)})
+            copy_failures.append(
+                {
+                    "file_id": item["file_id"],
+                    "rel_path": item["rel_path"],
+                    "reason": str(exc),
+                }
+            )
 
     manifest["summary"]["created_directories"] = created_directories
     manifest["summary"]["copied_original_files"] = copied_files
@@ -165,26 +190,11 @@ def build_destination_root(src_root: str | Path, dst_root: str | Path | None = N
 
 
 def write_json(output_path: str | Path, payload: dict) -> None:
-    output_file = Path(output_path).expanduser().resolve()
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _iter_files(src_root: Path):
-    for path in sorted(src_root.rglob("*")):
-        if path.is_file():
-            yield path
-
-
-def _iter_directories(src_root: Path):
-    yield src_root
-    for path in sorted(src_root.rglob("*")):
-        if path.is_dir():
-            yield path
+    atomic_write_json(output_path, payload)
 
 
 def _build_cn_rel_path(rel_path: str, category: str) -> str | None:
-    if category not in {"document", "code"}:
+    if category not in LLM_CATEGORIES:
         return None
 
     rel = Path(rel_path)
@@ -200,7 +210,7 @@ def _llm_action(category: str) -> str | None:
 
 
 def _estimate_rounds(char_count: int, category: str) -> int:
-    if category not in {"document", "code"}:
+    if category not in LLM_CATEGORIES:
         return 0
     return max(1, math.ceil(max(char_count, 1) / CHUNK_CHAR_TARGET))
 
@@ -213,7 +223,7 @@ def _estimate_total_token_range(category: str, input_tokens: int) -> tuple[int, 
     return 0, 0
 
 
-def _empty_summary() -> dict:
+def _empty_summary(batch_size: int) -> dict:
     return {
         "root_interpretation": "exact-user-path",
         "top_level_files": 0,
@@ -224,6 +234,8 @@ def _empty_summary() -> dict:
         "code_files": 0,
         "other_files": 0,
         "llm_files": 0,
+        "llm_batch_count": 0,
+        "batch_size": batch_size,
         "estimated_text_chars": 0,
         "estimated_input_tokens": 0,
         "estimated_tokens_low": 0,
@@ -231,6 +243,8 @@ def _empty_summary() -> dict:
         "estimated_rounds": 0,
         "estimated_minutes_low": 0,
         "estimated_minutes_high": 0,
+        "estimated_duration_minutes_low": 0,
+        "estimated_duration_minutes_high": 0,
         "oversized_files": [],
         "undecodable_files": [],
         "risk_flags": [],
@@ -259,8 +273,9 @@ def _update_summary(summary: dict, item: dict) -> None:
     summary["total_files"] += 1
     summary[f"{item['category']}_files"] += 1
 
-    if item["category"] in {"document", "code"}:
+    if item["category"] in LLM_CATEGORIES:
         summary["llm_files"] += 1
+        summary["llm_batch_count"] = max(summary["llm_batch_count"], item["batch_index"] or 0)
         summary["estimated_text_chars"] += item["estimated_chars"]
         summary["estimated_input_tokens"] += item["estimated_input_tokens"]
         summary["estimated_tokens_low"] += item["estimated_tokens_low"]
@@ -274,6 +289,7 @@ def _update_summary(summary: dict, item: dict) -> None:
         if item["estimated_chars"] >= SINGLE_FILE_RISK_CHARS:
             summary["oversized_files"].append(
                 {
+                    "file_id": item["file_id"],
                     "rel_path": item["rel_path"],
                     "estimated_chars": item["estimated_chars"],
                 }
@@ -282,6 +298,7 @@ def _update_summary(summary: dict, item: dict) -> None:
         if item["read_error"]:
             summary["undecodable_files"].append(
                 {
+                    "file_id": item["file_id"],
                     "rel_path": item["rel_path"],
                     "reason": item["read_error"],
                 }
@@ -289,8 +306,12 @@ def _update_summary(summary: dict, item: dict) -> None:
 
 
 def _finalize_summary(summary: dict) -> None:
-    summary["estimated_minutes_low"] = math.ceil(summary["estimated_rounds"] * 0.4)
-    summary["estimated_minutes_high"] = math.ceil(summary["estimated_rounds"] * 1.5)
+    minutes_low = math.ceil(summary["estimated_rounds"] * 0.4)
+    minutes_high = math.ceil(summary["estimated_rounds"] * 1.5)
+    summary["estimated_minutes_low"] = minutes_low
+    summary["estimated_minutes_high"] = minutes_high
+    summary["estimated_duration_minutes_low"] = minutes_low
+    summary["estimated_duration_minutes_high"] = minutes_high
 
     risk_flags = []
     if summary["llm_files"] > TOTAL_LLM_FILES_RISK:

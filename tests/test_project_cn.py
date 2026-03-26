@@ -13,6 +13,7 @@ SCRIPTS_DIR = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import job_runner  # noqa: E402
+import job_state  # noqa: E402
 import planning  # noqa: E402
 from classification import classify_file  # noqa: E402
 
@@ -52,7 +53,27 @@ class ProjectCnTests(unittest.TestCase):
             self.assertEqual(result["summary"]["code_files"], 1)
             self.assertEqual(result["summary"]["other_files"], 1)
             self.assertEqual(result["summary"]["llm_files"], 2)
+            self.assertEqual(result["summary"]["llm_batch_count"], 1)
             self.assertFalse(result["summary"]["requires_confirmation"])
+
+    def test_assess_project_assigns_stable_file_ids_and_batch_indexes_for_large_llm_set(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            src_root.mkdir()
+
+            for index in range(600):
+                (src_root / f"doc-{index:03d}.md").write_text("# Demo\n", encoding="utf-8")
+
+            result = planning.assess_project(src_root)
+            items = result["items"]
+
+            self.assertEqual(items[0]["file_id"], "F000001")
+            self.assertEqual(items[-1]["file_id"], "F000600")
+            self.assertEqual(items[0]["batch_index"], 1)
+            self.assertEqual(items[19]["batch_index"], 1)
+            self.assertEqual(items[20]["batch_index"], 2)
+            self.assertEqual(items[-1]["batch_index"], 30)
+            self.assertEqual(result["summary"]["llm_batch_count"], 30)
 
     def test_prepare_project_copy_replaces_existing_destination_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -90,6 +111,10 @@ class ProjectCnTests(unittest.TestCase):
 
             self.assertEqual(items["docs/README"]["cn_rel_path"], "docs/README-CN")
             self.assertEqual(items["src/app.ts"]["cn_rel_path"], "src/app-CN.ts")
+            self.assertEqual(items["docs/README"]["file_id"], "F000001")
+            self.assertEqual(items["src/app.ts"]["file_id"], "F000002")
+            self.assertEqual(items["docs/README"]["batch_index"], 1)
+            self.assertEqual(items["src/app.ts"]["batch_index"], 1)
             self.assertIsNone(items["docs/README"]["copy_failure"])
             self.assertIsNone(items["src/app.ts"]["copy_failure"])
 
@@ -212,52 +237,135 @@ class ProjectCnTests(unittest.TestCase):
             self.assertFalse(output_file.exists())
             self.assertIn("source root", completed.stderr)
 
-    def test_skill_mentions_parallel_multi_agent_strategy(self):
-        skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    def test_start_job_creates_manifest_progress_and_lock_under_cn_output_folder(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "src").mkdir(parents=True)
+            (src_root / "docs" / "guide.md").write_text("# Demo\n", encoding="utf-8")
+            (src_root / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
 
-        required_phrases = [
-            "多子智能体",
-            "并行",
-            "文件归属",
-            "冲突",
-            "主 agent",
-            "汇总",
-            "AAA-translate-output",
-        ]
+            job = job_runner.start_job(src_root)
+            output_dir = Path(job["dst_root"]) / job_state.OUTPUT_DIR_NAME
 
-        for phrase in required_phrases:
-            self.assertIn(phrase, skill_text)
+            self.assertEqual(Path(job["job_dir"]), output_dir)
+            self.assertTrue((output_dir / job_state.MANIFEST_FILE).exists())
+            self.assertTrue((output_dir / job_state.PROGRESS_FILE).exists())
+            self.assertTrue((output_dir / job_state.ORIGINALS_LOCK_FILE).exists())
+            self.assertTrue((output_dir / job_state.JOB_INFO_FILE).exists())
+            self.assertEqual(job["next_batch"]["batch_index"], 1)
+            self.assertEqual(len(job["next_batch"]["items"]), 2)
 
-    def test_skill_forbids_manual_scanning_and_requires_manifest_driven_processing(self):
-        skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    def test_status_reads_progress_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "docs" / "guide.md").write_text("# Demo\n", encoding="utf-8")
 
-        required_phrases = [
-            "translate-manifest.json",
-            "隐藏目录",
-            "点开头",
-            "无扩展名文档",
-            "不要依赖手工扫描",
-            "不要手动判断",
-        ]
+            job = job_runner.start_job(src_root)
+            status = job_runner.get_job_status(job["dst_root"])
 
-        for phrase in required_phrases:
-            self.assertIn(phrase, skill_text)
+            self.assertEqual(status["summary"]["in_progress_llm_files"], 1)
+            self.assertEqual(status["current_batch"]["batch_index"], 1)
+            self.assertEqual(status["refresh_checkpoint_count"], 1)
 
-    def test_start_job_stores_internal_outputs_under_cn_output_folder(self):
+    def test_mark_updates_progress_after_each_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            (src_root / "docs").mkdir(parents=True)
+            (src_root / "docs" / "guide.md").write_text("# Demo\n", encoding="utf-8")
+
+            job = job_runner.start_job(src_root)
+            file_id = job["next_batch"]["items"][0]["file_id"]
+
+            result = job_runner.mark_job_file(job["dst_root"], file_id, status="completed")
+            progress = job_state.load_json(Path(job["job_dir"]) / job_state.PROGRESS_FILE)
+            item = next(item for item in progress["items"] if item["file_id"] == file_id)
+
+            self.assertEqual(result["updated_item"]["status"], "completed")
+            self.assertEqual(item["status"], "completed")
+            self.assertIsNotNone(item["completed_at"])
+
+    def test_resume_reuses_existing_in_progress_batch(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_root = Path(tmpdir) / "demo"
             src_root.mkdir()
-            (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            for index in range(25):
+                (src_root / f"doc-{index:02d}.md").write_text("# Demo\n", encoding="utf-8")
 
             job = job_runner.start_job(src_root)
-            output_dir = Path(job["dst_root"]) / "AAA-translate-output"
+            resumed = job_runner.resume_job(job["dst_root"])
 
-            self.assertEqual(Path(job["job_dir"]), output_dir)
-            self.assertTrue(output_dir.exists())
-            self.assertTrue(Path(job["manifest_path"]).exists())
-            self.assertEqual(Path(job["manifest_path"]).parent, output_dir)
-            self.assertTrue((output_dir / "translate-job.json").exists())
-            self.assertTrue((Path(job["dst_root"]) / "README.md").exists())
+            self.assertTrue(resumed["next_batch"]["reused_in_progress_batch"])
+            self.assertEqual(resumed["next_batch"]["batch_index"], 1)
+            self.assertEqual(len(resumed["next_batch"]["items"]), 20)
+
+    def test_resume_advances_to_next_batch_after_current_batch_is_completed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            src_root.mkdir()
+            for index in range(25):
+                (src_root / f"doc-{index:02d}.md").write_text("# Demo\n", encoding="utf-8")
+
+            job = job_runner.start_job(src_root)
+            for item in job["next_batch"]["items"]:
+                job_runner.mark_job_file(job["dst_root"], item["file_id"], status="completed")
+
+            resumed = job_runner.resume_job(job["dst_root"])
+
+            self.assertFalse(resumed["next_batch"]["reused_in_progress_batch"])
+            self.assertEqual(resumed["next_batch"]["batch_index"], 2)
+            self.assertEqual(len(resumed["next_batch"]["items"]), 5)
+            self.assertEqual(resumed["summary"]["refresh_checkpoint_count"], 2)
+
+    def test_resume_returns_complete_when_no_pending_files_remain(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            src_root.mkdir()
+            (src_root / "guide.md").write_text("# Demo\n", encoding="utf-8")
+
+            job = job_runner.start_job(src_root)
+            file_id = job["next_batch"]["items"][0]["file_id"]
+            job_runner.mark_job_file(job["dst_root"], file_id, status="completed")
+
+            resumed = job_runner.resume_job(job["dst_root"])
+
+            self.assertEqual(resumed["next_batch"]["status"], "complete")
+            self.assertEqual(resumed["summary"]["pending_llm_files"], 0)
+
+    def test_report_flags_modified_source_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            src_root.mkdir()
+            (src_root / "guide.md").write_text("# Demo\n", encoding="utf-8")
+
+            job = job_runner.start_job(src_root)
+            batch_item = job["next_batch"]["items"][0]
+            Path(batch_item["cn_file"]).write_text("# 演示\n", encoding="utf-8")
+            job_runner.mark_job_file(job["dst_root"], batch_item["file_id"], status="completed")
+
+            (src_root / "guide.md").write_text("# Mutated\n", encoding="utf-8")
+            report = job_runner.build_job_report(job["dst_root"])
+
+            self.assertFalse(report["source_integrity_ok"])
+            self.assertEqual(len(report["modified_source_files"]), 1)
+
+    def test_report_flags_modified_original_copies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo"
+            src_root.mkdir()
+            (src_root / "guide.md").write_text("# Demo\n", encoding="utf-8")
+
+            job = job_runner.start_job(src_root)
+            batch_item = job["next_batch"]["items"][0]
+            Path(batch_item["cn_file"]).write_text("# 演示\n", encoding="utf-8")
+            job_runner.mark_job_file(job["dst_root"], batch_item["file_id"], status="completed")
+
+            Path(batch_item["copied_file"]).write_text("# Mutated\n", encoding="utf-8")
+            report = job_runner.build_job_report(job["dst_root"])
+
+            self.assertFalse(report["copied_original_integrity_ok"])
+            self.assertEqual(len(report["modified_original_copies"]), 1)
 
     def test_build_job_report_writes_reports_under_cn_output_folder(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -267,21 +375,21 @@ class ProjectCnTests(unittest.TestCase):
             (src_root / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
 
             job = job_runner.start_job(src_root)
-            dst_root = Path(job["dst_root"])
-            output_dir = dst_root / "AAA-translate-output"
-            (dst_root / "README-CN.md").write_text("# 演示\n", encoding="utf-8")
+            for item in job["next_batch"]["items"]:
+                Path(item["cn_file"]).write_text("generated\n", encoding="utf-8")
+                job_runner.mark_job_file(job["dst_root"], item["file_id"], status="completed")
 
             report = job_runner.build_job_report(job["dst_root"])
+            output_dir = Path(job["dst_root"]) / job_state.OUTPUT_DIR_NAME
+            final_report_text = (output_dir / job_state.TEXT_REPORT_FILE).read_text(encoding="utf-8")
 
-            self.assertEqual(report["generated"]["document_cn_files"], 1)
-            self.assertEqual(report["generated"]["code_cn_files"], 0)
-            self.assertEqual(len(report["missing_cn_files"]), 1)
-            self.assertTrue((output_dir / "translate-verify-report.json").exists())
-            self.assertTrue((output_dir / "translate-final-report.txt").exists())
-            final_report_text = (output_dir / "translate-final-report.txt").read_text(encoding="utf-8")
+            self.assertEqual(report["status"], "ok")
+            self.assertTrue((output_dir / job_state.VERIFY_REPORT_FILE).exists())
+            self.assertTrue((output_dir / job_state.TEXT_REPORT_FILE).exists())
             self.assertIn("=== 项目翻译结果报告 ===", final_report_text)
             self.assertIn("工作量摘要：", final_report_text)
-            self.assertIn("产出结果：", final_report_text)
+            self.assertIn("进度摘要：", final_report_text)
+            self.assertIn("原文件保护：", final_report_text)
 
     def test_job_runner_report_rejects_output_file_inside_source_root(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -310,7 +418,7 @@ class ProjectCnTests(unittest.TestCase):
             self.assertFalse(output_file.exists())
             self.assertIn("source root", completed.stderr)
 
-    def test_verify_outputs_reports_missing_cn_files(self):
+    def test_verify_outputs_reports_missing_cn_files_and_integrity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_root = Path(tmpdir) / "demo"
             src_root.mkdir()
@@ -318,15 +426,29 @@ class ProjectCnTests(unittest.TestCase):
             (src_root / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
 
             manifest = planning.prepare_project_copy(src_root)
+            lock = job_state.build_originals_lock(manifest)
+            progress = job_state.build_progress(manifest, job_id="demo")
             manifest_path = Path(tmpdir) / "manifest.json"
+            progress_path = Path(tmpdir) / "progress.json"
+            lock_path = Path(tmpdir) / "lock.json"
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+            lock_path.write_text(json.dumps(lock, ensure_ascii=False, indent=2), encoding="utf-8")
 
             readme_cn = Path(manifest["dst_root"]) / "README-CN.md"
             readme_cn.write_text("# 演示\n", encoding="utf-8")
 
             verify_script = SCRIPTS_DIR / "verify_outputs.py"
             completed = subprocess.run(
-                [sys.executable, str(verify_script), str(manifest_path)],
+                [
+                    sys.executable,
+                    str(verify_script),
+                    str(manifest_path),
+                    "--progress",
+                    str(progress_path),
+                    "--lock",
+                    str(lock_path),
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -337,10 +459,47 @@ class ProjectCnTests(unittest.TestCase):
             self.assertEqual(report["generated"]["document_cn_files"], 1)
             self.assertEqual(report["generated"]["code_cn_files"], 0)
             self.assertEqual(len(report["missing_cn_files"]), 1)
+            self.assertTrue(report["source_integrity_ok"])
+
+    def test_skill_mentions_large_project_protocol(self):
+        skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        required_phrases = [
+            "translate-progress.json",
+            "translate-originals-lock.json",
+            "resume",
+            "status",
+            "mark",
+            "每 20 个文件强制刷新",
+            "不得改 copied_file",
+            "不得改源目录",
+            "manifest + progress",
+            "下一批文件只能从进度账本里取",
+        ]
+
+        for phrase in required_phrases:
+            self.assertIn(phrase, skill_text)
+
+    def test_skill_mentions_parallel_multi_agent_strategy(self):
+        skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        required_phrases = [
+            "多子智能体",
+            "并行",
+            "文件归属",
+            "冲突",
+            "主 agent",
+            "汇总",
+            "AAA-translate-output",
+        ]
+
+        for phrase in required_phrases:
+            self.assertIn(phrase, skill_text)
 
     def test_python_sources_disable_bytecode_cache(self):
         targets = [
             SKILL_ROOT / "scripts" / "job_runner.py",
+            SKILL_ROOT / "scripts" / "job_state.py",
             SKILL_ROOT / "scripts" / "prepare_job.py",
             SKILL_ROOT / "scripts" / "planning.py",
             SKILL_ROOT / "scripts" / "verify_outputs.py",
