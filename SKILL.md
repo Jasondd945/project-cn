@@ -558,3 +558,5 @@ python "<skill_dir>\scripts\job_runner.py" report "<A-CN>\AAA-translate-output"
 - `项目扫描 / 隐藏目录遗漏`：使用 Glob 扫描项目时，`**/*` 模式默认会跳过以 `.` 开头的隐藏目录（如 `.claude-plugin`、`.git` 等）。必须显式扫描这些隐藏目录，或在复制阶段直接使用 `cp -r` 复制整个源目录（包括隐藏文件）。下次扫描前先检查是否有 `.claude-plugin`、`.github`、`.vscode` 等常见隐藏目录。
 - `绕过脚本手动处理 / 致命错误`：**禁止绕过 `job_runner.py` 脚本直接手动处理**。手动处理会导致：1) 遗漏隐藏目录（如 `.claude-plugin`），2) 错误判断文件分类（如误以为 LICENSE 不需要翻译），3) 无法生成 manifest 清单导致无法验证完整性。如果脚本不存在，立即报错停止，不得手动替代。
 - `文件分类错误 / LICENSE 遗漏`：LICENSE 明确属于 A 类文档文件（技能规范第 92 行明确列出），必须生成 `LICENSE-CN` 副本。不得因为"法律文件""标准模板"等主观判断而跳过。所有 A 类文件（README、CHANGELOG、CONTRIBUTING、LICENSE、NOTES、GUIDE、FAQ、MANUAL）都必须翻译。
+- `子代理路径错误 / 文件位置偏离`：子代理在处理 -CN 文件时，可能使用相对路径导致文件被写入错误位置（如项目根目录的 `skills/` 而非 `A-CN/skills/`）。**对策**：1) 为子代理提供完整的绝对目标路径；2) 任务完成后检查生成的文件位置；3) 清理错误位置的重复文件；4) 在任务说明中明确指定输出路径格式。
+- `临时调试产物 / 源目录污染`：主 agent 在调试 report 输出格式时，不应将中间 JSON 文件（如 `final_report.json`）重定向到源目录 `A` 或项目根目录。**对策**：1) 所有中间产物一律写到系统临时目录或 `A-CN/AAA-translate-output`；2) 调试完成后立即清理临时文件；3) 需要导出报告时只用 `job_runner.py report --output` 指定 `A-CN/AAA-translate-output` 内路径。
