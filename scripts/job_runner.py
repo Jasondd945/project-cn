@@ -51,6 +51,7 @@ def start_job(
     next_batch = job_state.checkout_next_batch(progress)
     progress_path = job_dir / job_state.PROGRESS_FILE
     job_state.atomic_write_json(progress_path, progress)
+    guidance = _build_start_guidance(manifest["summary"], progress["summary"])
 
     job_info = {
         "job_id": job_id,
@@ -62,6 +63,11 @@ def start_job(
         "dst_root": manifest["dst_root"],
         "summary": manifest["summary"],
         "progress_summary": progress["summary"],
+        "project_profile": manifest["summary"].get("project_profile", {}),
+        "project_profile_summary": manifest["summary"].get("project_profile", {}).get("user_summary"),
+        "user_message": guidance["user_message"],
+        "internal_reason": guidance["internal_reason"],
+        "operator_advice": guidance["user_message"],
         "batch_size": batch_size,
         "selected_priority_scope": progress["summary"].get("selected_priority_scope"),
         "created_at": _utc_timestamp(),
@@ -93,14 +99,19 @@ def resume_job(job_ref: str | Path, retry_failed: bool = False) -> dict:
 def decide_job_scope(job_ref: str | Path, decision: str) -> dict:
     job_dir = job_state.resolve_job_dir(job_ref)
     progress = job_state.load_json(job_dir / job_state.PROGRESS_FILE)
+    manifest = job_state.load_json(job_dir / job_state.MANIFEST_FILE)
     result = job_state.set_scope_decision(progress, decision)
     job_state.atomic_write_json(job_dir / job_state.PROGRESS_FILE, progress)
     job_info = job_state.load_json_if_exists(job_dir / job_state.JOB_INFO_FILE)
+    guidance = _build_scope_guidance(manifest.get("summary", {}), progress["summary"], decision)
 
     return {
         "job_id": job_info.get("job_id", job_dir.name),
         "job_dir": str(job_dir),
         "progress_path": str(job_dir / job_state.PROGRESS_FILE),
+        "user_message": guidance["user_message"],
+        "internal_reason": guidance["internal_reason"],
+        "operator_advice": guidance["user_message"],
         **result,
     }
 
@@ -120,6 +131,7 @@ def get_job_status(job_ref: str | Path) -> dict:
         }
     else:
         current_batch = None
+    guidance = _build_runtime_guidance(manifest.get("summary", {}), progress["summary"])
 
     return {
         "job_id": job_info.get("job_id", job_dir.name),
@@ -127,6 +139,11 @@ def get_job_status(job_ref: str | Path) -> dict:
         "src_root": manifest["src_root"],
         "dst_root": manifest["dst_root"],
         "summary": progress["summary"],
+        "project_profile": manifest.get("summary", {}).get("project_profile", {}),
+        "project_profile_summary": manifest.get("summary", {}).get("project_profile", {}).get("user_summary"),
+        "user_message": guidance["user_message"],
+        "internal_reason": guidance["internal_reason"],
+        "operator_advice": guidance["user_message"],
         "current_batch": current_batch,
         "next_pending_batch_index": progress["summary"].get("next_pending_batch_index"),
         "refresh_checkpoint_count": progress["summary"].get("refresh_checkpoint_count", 0),
@@ -187,6 +204,12 @@ def build_job_report(job_ref: str | Path) -> dict:
         status = "awaiting_scope_decision"
     elif progress_summary.get("skipped_priority_tiers"):
         status = "complete_with_skipped_tiers"
+    guidance = _build_runtime_guidance(
+        manifest.get("summary", {}),
+        progress_summary,
+        report_mode=True,
+        report_status=status,
+    )
 
     final_report = {
         "job_id": job_info.get("job_id", job_dir.name),
@@ -194,6 +217,11 @@ def build_job_report(job_ref: str | Path) -> dict:
         "src_root": manifest["src_root"],
         "dst_root": manifest["dst_root"],
         "summary": manifest.get("summary", {}),
+        "project_profile": manifest.get("summary", {}).get("project_profile", {}),
+        "project_profile_summary": manifest.get("summary", {}).get("project_profile", {}).get("user_summary"),
+        "user_message": guidance["user_message"],
+        "internal_reason": guidance["internal_reason"],
+        "operator_advice": guidance["user_message"],
         "progress_summary": progress_summary,
         "generated": verify_report["generated"],
         "missing_original_copies": verify_report["missing_original_copies"],
@@ -224,6 +252,7 @@ def _format_text_report(report: dict) -> str:
     progress_summary = report["progress_summary"]
     generated = report["generated"]
     priority_tiers = summary.get("priority_tiers", {})
+    project_profile = summary.get("project_profile", {})
     root_mode = (
         "严格使用用户给定路径"
         if summary.get("root_interpretation", "exact-user-path") == "exact-user-path"
@@ -254,6 +283,14 @@ def _format_text_report(report: dict) -> str:
     )
     next_action_text = _format_next_action(report.get("next_action"))
     remaining_priority_tiers = report.get("remaining_priority_tiers", {})
+    project_signals = "、".join(project_profile.get("signals", [])) or "无"
+    project_notes = "；".join(project_profile.get("analysis_notes", [])) or "无"
+    fixed_dirs = "、".join(project_profile.get("fixed_tier_1_dirs", [])) or "无"
+    dynamic_dirs = "、".join(project_profile.get("dynamic_tier_1_dirs", [])) or "无"
+    dynamic_root_files = "、".join(project_profile.get("dynamic_tier_1_root_files", [])) or "无"
+    profile_summary_text = report.get("project_profile_summary") or project_profile.get("user_summary", "无")
+    user_message = report.get("user_message", "无")
+    internal_reason = report.get("internal_reason", "无")
 
     lines = [
         "=== 项目翻译结果报告 ===",
@@ -267,6 +304,17 @@ def _format_text_report(report: dict) -> str:
         f"- 顶层目录数：{summary.get('top_level_dirs', 0)}",
         f"- 顶层文件数：{summary.get('top_level_files', 0)}",
         f"- 是否检测到单子目录包装壳：{wrapper_detected}",
+        "",
+        "项目画像：",
+        f"- 主类型：{project_profile.get('label', '通用项目')}",
+        f"- 识别信号：{project_signals}",
+        f"- 固定进入 1 档的核心目录：{fixed_dirs}",
+        f"- 动态提升到 1 档的目录：{dynamic_dirs}",
+        f"- 动态提升到 1 档的根文件：{dynamic_root_files}",
+        f"- 画像判断：{project_notes}",
+        f"- 用户可读摘要：{profile_summary_text}",
+        f"- 对用户提示：{user_message}",
+        f"- 内部判断：{internal_reason}",
         "",
         "工作量摘要：",
         f"- 文件总数：{summary.get('total_files', 0)}",
@@ -376,6 +424,145 @@ def _format_next_action(next_action: str | None) -> str:
         "await_scope_decision": "等待用户做档位决定",
     }
     return mapping.get(next_action, next_action or "无")
+
+
+def _build_start_guidance(summary: dict, progress_summary: dict) -> dict:
+    profile = summary.get("project_profile", {})
+    profile_summary = profile.get("user_summary", "已完成项目画像分析。")
+    tier_1 = summary.get("priority_tiers", {}).get("tier_1", {})
+    tier_1_count = tier_1.get("total_files", 0)
+    tier_1_doc = tier_1.get("document_files", 0)
+    tier_1_code = tier_1.get("code_files", 0)
+    tier_1_other = tier_1.get("other_files", 0)
+    focus_paths = "、".join(profile.get("first_pass_focus_paths", [])[:3]) or "无"
+    recommended_scope = summary.get("priority_tier_recommended_scope")
+
+    if recommended_scope == "tier_1_only":
+        scope_advice = (
+            f"建议先只处理 1 档，共 {tier_1_count} 个文件"
+            f"（文档 {tier_1_doc} / 代码 {tier_1_code} / 其他 {tier_1_other}），"
+            "处理完后再确认是否进入 2 档。"
+        )
+    elif recommended_scope == "tier_1_and_2":
+        scope_advice = (
+            f"建议先处理 1 档和 2 档，但当前先从 1 档开始建立项目理解；"
+            f"1 档共有 {tier_1_count} 个文件（文档 {tier_1_doc} / 代码 {tier_1_code} / 其他 {tier_1_other}）。"
+        )
+    else:
+        scope_advice = (
+            f"当前项目可以直接处理全部档位，但仍建议先从 1 档入手；"
+            f"1 档共有 {tier_1_count} 个文件（文档 {tier_1_doc} / 代码 {tier_1_code} / 其他 {tier_1_other}）。"
+        )
+
+    next_action = _format_next_action(progress_summary.get("next_action"))
+    user_message = f"{scope_advice} 首轮优先关注：{focus_paths}。"
+    internal_reason = f"{profile_summary} {scope_advice} 当前下一步：{next_action}。"
+    return {
+        "user_message": user_message,
+        "internal_reason": internal_reason,
+    }
+
+
+def _build_runtime_guidance(
+    summary: dict,
+    progress_summary: dict,
+    report_mode: bool = False,
+    report_status: str | None = None,
+) -> dict:
+    profile = summary.get("project_profile", {})
+    profile_summary = profile.get("user_summary", "已完成项目画像分析。")
+    next_action = progress_summary.get("next_action")
+    pending_in_scope = progress_summary.get("pending_llm_files_in_scope", 0)
+    failed_in_scope = progress_summary.get("failed_llm_files_in_scope", 0)
+    next_locked_tier = progress_summary.get("next_locked_tier")
+
+    if report_mode and report_status == "complete_with_skipped_tiers":
+        skipped = progress_summary.get("skipped_priority_tiers", [])
+        skipped_text = "、".join(f"{tier} 档" for tier in skipped) or "无"
+        return {
+            "user_message": f"当前范围已完成，已按你的决定跳过：{skipped_text}。",
+            "internal_reason": f"{profile_summary} 已按用户决策完成当前范围，跳过档位：{skipped_text}。",
+        }
+
+    if report_mode and report_status == "ok":
+        return {
+            "user_message": "当前允许范围内的文件已经处理完成，可以直接查看结果或结束本轮任务。",
+            "internal_reason": f"{profile_summary} 当前允许范围内的文件已经处理完成，可以直接查看结果或结束本轮任务。",
+        }
+
+    if next_action == "finish_current_batch":
+        return {
+            "user_message": "先完成当前这一批文件，完成后我再判断是否继续放开下一档。",
+            "internal_reason": f"{profile_summary} 当前先完成这一批文件，完成后再根据状态决定是否继续放开下一档。",
+        }
+    if next_action == "resume":
+        return {
+            "user_message": f"当前范围内还有 {pending_in_scope} 个待处理文件，可以直接继续下一批。",
+            "internal_reason": f"{profile_summary} 当前范围内还有 {pending_in_scope} 个待处理 LLM 文件，可以直接继续下一批。",
+        }
+    if next_action == "ask_user_about_tier_2":
+        return {
+            "user_message": "1 档已处理完，是否继续进入 2 档？",
+            "internal_reason": f"{profile_summary} 1 档已处理完，请先向用户确认是否进入 2 档。",
+        }
+    if next_action == "ask_user_about_tier_3":
+        return {
+            "user_message": "1+2 档已处理完，是否继续进入 3 档？",
+            "internal_reason": f"{profile_summary} 1+2 档已处理完，请先向用户确认是否进入 3 档。",
+        }
+    if next_action == "await_scope_decision":
+        locked_text = f"{next_locked_tier} 档" if next_locked_tier is not None else "下一档"
+        return {
+            "user_message": f"当前正在等待你决定是否放开{locked_text}。",
+            "internal_reason": f"{profile_summary} 当前正在等待用户决定是否放开{locked_text}。",
+        }
+    if next_action == "report":
+        return {
+            "user_message": "当前范围已处理完，可以生成最终报告。",
+            "internal_reason": f"{profile_summary} 当前范围已处理完，可以生成最终报告。",
+        }
+
+    if failed_in_scope > 0:
+        return {
+            "user_message": f"当前范围内有 {failed_in_scope} 个失败文件，建议先处理失败项再继续。",
+            "internal_reason": f"{profile_summary} 当前范围内有 {failed_in_scope} 个失败文件，建议先处理失败项再继续。",
+        }
+
+    return {
+        "user_message": "当前可继续按状态机推进下一步。",
+        "internal_reason": f"{profile_summary} 当前可继续按状态机推进下一步。",
+    }
+
+
+def _build_scope_guidance(summary: dict, progress_summary: dict, decision: str) -> dict:
+    profile = summary.get("project_profile", {})
+    profile_summary = profile.get("user_summary", "已完成项目画像分析。")
+    next_action = progress_summary.get("next_action")
+    next_action_text = _format_next_action(next_action)
+    next_locked_tier = progress_summary.get("next_locked_tier")
+    next_locked_tier_text = f"{next_locked_tier} 档" if next_locked_tier is not None else "无"
+
+    if decision == job_state.SCOPE_TIER_1_ONLY:
+        user_message = "已确认当前只处理 1 档。1 档处理完后，我会停下来再问你是否进入 2 档。"
+    elif decision == job_state.SCOPE_TIER_1_AND_2:
+        user_message = "已放开 1+2 档，可以继续处理下一批；2 档处理完后我会再问你是否进入 3 档。"
+    elif decision == job_state.SCOPE_ALL_TIERS:
+        user_message = "已放开全部档位，可以继续处理剩余文件。"
+    elif decision == job_state.SCOPE_DECISION_SKIP_TIER_3:
+        user_message = "已确认后续跳过 3 档，只处理 1+2 档。"
+    else:
+        user_message = "档位决策已更新。"
+
+    internal_reason = (
+        f"{profile_summary} 本次 scope 决策为 `{decision}`，"
+        f"当前范围：{progress_summary.get('selected_priority_scope_label')}，"
+        f"下一待解锁档位：{next_locked_tier_text}，"
+        f"下一建议动作：{next_action_text}。"
+    )
+    return {
+        "user_message": user_message,
+        "internal_reason": internal_reason,
+    }
 
 
 def _remove_stale_internal_outputs(job_dir: Path) -> None:

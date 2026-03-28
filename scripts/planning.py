@@ -184,6 +184,15 @@ ROOT_CORE_OTHER_FILENAMES = {
     ".env.example",
 }
 
+PROJECT_PROFILE_LABELS = {
+    "generic-project": "通用项目",
+    "agent-skill": "Agent Skill 工程",
+    "node-web-application": "Node/Web 应用",
+    "node-application": "Node 应用",
+    "python-application": "Python 应用",
+    "backend-application": "后端服务工程",
+}
+
 DEFAULT_EXCLUDED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -236,7 +245,6 @@ def assess_project(
         estimated_rounds = _estimate_rounds(metrics["estimated_chars"], category)
         estimated_input_tokens = estimate_input_tokens(metrics["estimated_chars"])
         token_low, token_high = _estimate_total_token_range(category, estimated_input_tokens)
-        priority_tier, priority_reason = _classify_priority_tier(rel_path, category)
 
         item = {
             "rel_path": rel_path,
@@ -245,9 +253,6 @@ def assess_project(
             "copied_rel_path": rel_path,
             "cn_rel_path": cn_rel_path,
             "llm_action": _llm_action(category),
-            "priority_tier": priority_tier,
-            "priority_tier_label": PRIORITY_TIER_LABELS[priority_tier],
-            "priority_reason": priority_reason,
             "size_bytes": metrics["size_bytes"],
             "estimated_chars": metrics["estimated_chars"],
             "estimated_input_tokens": estimated_input_tokens,
@@ -259,6 +264,19 @@ def assess_project(
             "sample_based": metrics["sample_based"],
         }
         raw_items.append(item)
+
+    project_profile = _infer_project_profile(src_path, raw_items)
+    summary["project_profile"] = project_profile
+
+    for item in raw_items:
+        priority_tier, priority_reason = _classify_priority_tier(
+            item["rel_path"],
+            item["category"],
+            project_profile,
+        )
+        item["priority_tier"] = priority_tier
+        item["priority_tier_label"] = PRIORITY_TIER_LABELS[priority_tier]
+        item["priority_reason"] = priority_reason
 
     raw_items.sort(key=_item_sort_key)
 
@@ -436,6 +454,7 @@ def _empty_summary(batch_size: int) -> dict:
             "all_tiers",
             "skip_tier_3",
         ],
+        "project_profile": _empty_project_profile(),
     }
 
 
@@ -527,6 +546,7 @@ def _finalize_summary(summary: dict) -> None:
     summary["priority_tier_decision_recommended"] = tier_decision_recommended
     summary["priority_tier_recommended_scope"] = _recommended_tier_scope(summary)
     summary["requires_confirmation"] = bool(risk_flags)
+    _finalize_project_profile(summary)
 
 
 def _utc_timestamp() -> str:
@@ -561,7 +581,7 @@ def _item_sort_key(item: dict) -> tuple[int, int, str]:
     )
 
 
-def _classify_priority_tier(rel_path: str, category: str) -> tuple[int, str]:
+def _classify_priority_tier(rel_path: str, category: str, project_profile: dict) -> tuple[int, str]:
     pure_path = PurePosixPath(rel_path)
     parts = [part.lower() for part in pure_path.parts]
     filename = parts[-1]
@@ -572,6 +592,10 @@ def _classify_priority_tier(rel_path: str, category: str) -> tuple[int, str]:
     matched_low_dir = next((part for part in parent_dirs if part in LOW_PRIORITY_DIRS), None)
     if matched_low_dir:
         return 3, f"位于低优先级目录 `{matched_low_dir}`"
+
+    profile_reason = _match_project_profile_tier_1_rule(parts, parent_dirs, filename, project_profile)
+    if profile_reason:
+        return 1, profile_reason
 
     if _is_test_like_filename(filename, stem):
         return 3, "测试或规格文件"
@@ -604,6 +628,177 @@ def _classify_priority_tier(rel_path: str, category: str) -> tuple[int, str]:
             return 2, "顶层辅助文件"
 
     return 2, "默认归入重要扩展层"
+
+
+def _empty_project_profile() -> dict:
+    return {
+        "primary_type": "generic-project",
+        "label": PROJECT_PROFILE_LABELS["generic-project"],
+        "signals": [],
+        "analysis_notes": ["未命中特定项目画像，使用通用分档规则。"],
+        "fixed_tier_1_dirs": ["agents"],
+        "dynamic_tier_1_dirs": [],
+        "dynamic_tier_1_root_files": [],
+        "contextual_tier_1_dirs": [],
+        "contextual_tier_1_root_files": [],
+        "first_pass_focus_paths": [],
+        "recommended_first_action": "",
+        "user_summary": "",
+    }
+
+
+def _infer_project_profile(src_path: Path, raw_items: list[dict]) -> dict:
+    profile = _empty_project_profile()
+    top_level_files: set[str] = set()
+    top_level_dirs: set[str] = set()
+    category_counts = {"document": 0, "code": 0, "other": 0}
+
+    for item in raw_items:
+        rel_path = PurePosixPath(item["rel_path"])
+        parts = [part.lower() for part in rel_path.parts]
+        if len(parts) == 1:
+            top_level_files.add(parts[0])
+        elif parts:
+            top_level_dirs.add(parts[0])
+        category_counts[item["category"]] += 1
+
+    profile_type = "generic-project"
+    signals: list[str] = []
+    analysis_notes: list[str] = []
+    fixed_tier_1_dirs: set[str] = {"agents"}
+    contextual_tier_1_dirs: set[str] = set(fixed_tier_1_dirs)
+    dynamic_tier_1_dirs: set[str] = set()
+    contextual_tier_1_root_files: set[str] = set()
+    dynamic_tier_1_root_files: set[str] = set()
+
+    if "skill.md" in top_level_files or {"agents", "references", "scripts"}.issubset(top_level_dirs):
+        profile_type = "agent-skill"
+        if "skill.md" in top_level_files:
+            signals.append("顶层存在 SKILL.md")
+            contextual_tier_1_root_files.add("skill.md")
+            dynamic_tier_1_root_files.add("skill.md")
+        for dirname in ("agents", "commands", "hooks"):
+            if dirname in top_level_dirs:
+                contextual_tier_1_dirs.add(dirname)
+                signals.append(f"存在 {dirname}/")
+                if dirname not in fixed_tier_1_dirs:
+                    dynamic_tier_1_dirs.add(dirname)
+        if "references" in top_level_dirs:
+            signals.append("存在 references/")
+        if "scripts" in top_level_dirs:
+            signals.append("存在 scripts/")
+        analysis_notes.append("识别为技能/agent 工程，执行定义目录和运行入口目录优先进入 1 档。")
+    elif "package.json" in top_level_files:
+        contextual_tier_1_root_files.add("package.json")
+        dynamic_tier_1_root_files.add("package.json")
+        signals.append("顶层存在 package.json")
+        if top_level_dirs.intersection({"app", "pages", "public", "src"}):
+            profile_type = "node-web-application"
+            matched_dirs = top_level_dirs.intersection({"src", "app", "pages", "api"})
+            contextual_tier_1_dirs.update(matched_dirs)
+            dynamic_tier_1_dirs.update(matched_dirs)
+            analysis_notes.append("识别为 Node/Web 应用，入口目录和接口目录优先进入 1 档。")
+            matched_dirs = sorted(top_level_dirs.intersection({"src", "app", "pages", "api", "public"}))
+            signals.extend(f"存在 {dirname}/" for dirname in matched_dirs)
+        else:
+            profile_type = "node-application"
+            matched_dirs = top_level_dirs.intersection({"src", "app", "api", "server", "client", "bin", "cli"})
+            contextual_tier_1_dirs.update(matched_dirs)
+            dynamic_tier_1_dirs.update(matched_dirs)
+            analysis_notes.append("识别为 Node 应用，核心源码和接口入口目录优先进入 1 档。")
+            matched_dirs = sorted(top_level_dirs.intersection({"src", "app", "api", "server", "client", "bin", "cli"}))
+            signals.extend(f"存在 {dirname}/" for dirname in matched_dirs)
+    elif top_level_files.intersection({"pyproject.toml", "requirements.txt", "setup.py", "manage.py"}):
+        profile_type = "python-application"
+        matched_files = sorted(top_level_files.intersection({"pyproject.toml", "requirements.txt", "setup.py", "manage.py"}))
+        contextual_tier_1_root_files.update(matched_files)
+        dynamic_tier_1_root_files.update(matched_files)
+        matched_dirs = top_level_dirs.intersection({"src", "app", "api", "server", "client"})
+        contextual_tier_1_dirs.update(matched_dirs)
+        dynamic_tier_1_dirs.update(matched_dirs)
+        signals.extend(f"顶层存在 {filename}" for filename in matched_files)
+        matched_dirs = sorted(top_level_dirs.intersection({"src", "app", "api", "server", "client"}))
+        signals.extend(f"存在 {dirname}/" for dirname in matched_dirs)
+        analysis_notes.append("识别为 Python 应用，入口脚本、依赖声明和核心源码目录优先进入 1 档。")
+    elif top_level_files.intersection({"go.mod", "cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts"}):
+        profile_type = "backend-application"
+        matched_files = sorted(
+            top_level_files.intersection({"go.mod", "cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts"})
+        )
+        contextual_tier_1_root_files.update(matched_files)
+        dynamic_tier_1_root_files.update(matched_files)
+        matched_dirs = top_level_dirs.intersection({"cmd", "src", "app", "api", "server", "internal"})
+        contextual_tier_1_dirs.update(matched_dirs)
+        dynamic_tier_1_dirs.update(matched_dirs)
+        signals.extend(f"顶层存在 {filename}" for filename in matched_files)
+        matched_dirs = sorted(top_level_dirs.intersection({"cmd", "src", "app", "api", "server", "internal"}))
+        signals.extend(f"存在 {dirname}/" for dirname in matched_dirs)
+        analysis_notes.append("识别为后端服务工程，启动入口、接口层和内部核心实现优先进入 1 档。")
+    else:
+        analysis_notes.append("未命中特定工程画像，继续使用通用分档规则。")
+
+    if category_counts["document"] > max(category_counts["code"] * 2, 20):
+        analysis_notes.append("文档数量明显高于代码，评估时会优先关注帮助理解项目的核心文档。")
+        signals.append("文档密度高")
+
+    profile["primary_type"] = profile_type
+    profile["label"] = PROJECT_PROFILE_LABELS[profile_type]
+    profile["signals"] = sorted(dict.fromkeys(signals))
+    profile["analysis_notes"] = analysis_notes
+    profile["fixed_tier_1_dirs"] = sorted(fixed_tier_1_dirs)
+    profile["dynamic_tier_1_dirs"] = sorted(dynamic_tier_1_dirs)
+    profile["dynamic_tier_1_root_files"] = sorted(dynamic_tier_1_root_files)
+    profile["contextual_tier_1_dirs"] = sorted(contextual_tier_1_dirs)
+    profile["contextual_tier_1_root_files"] = sorted(contextual_tier_1_root_files)
+    profile["project_name"] = src_path.name
+    return profile
+
+
+def _match_project_profile_tier_1_rule(
+    parts: list[str],
+    parent_dirs: list[str],
+    filename: str,
+    project_profile: dict,
+) -> str | None:
+    if len(parts) == 1 and filename in set(project_profile.get("contextual_tier_1_root_files", [])):
+        return f"根据项目画像 `{project_profile.get('label')}` 提升的核心根文件"
+
+    if parent_dirs[:1]:
+        top_dir = parent_dirs[0]
+        contextual_dirs = set(project_profile.get("contextual_tier_1_dirs", []))
+        if top_dir in contextual_dirs:
+            return f"根据项目画像 `{project_profile.get('label')}` 提升的核心目录 `{top_dir}`"
+
+    return None
+
+
+def _finalize_project_profile(summary: dict) -> None:
+    profile = summary.get("project_profile", _empty_project_profile())
+    tier_1_examples = summary.get("priority_tiers", {}).get("tier_1", {}).get("example_paths", [])
+    focus_paths = tier_1_examples[:5]
+    profile["first_pass_focus_paths"] = focus_paths
+
+    fixed_dirs = "、".join(profile.get("fixed_tier_1_dirs", [])) or "无"
+    dynamic_dirs = "、".join(profile.get("dynamic_tier_1_dirs", [])) or "无"
+    dynamic_root_files = "、".join(profile.get("dynamic_tier_1_root_files", [])) or "无"
+    focus_text = "、".join(focus_paths) or "无"
+
+    recommended_scope = {
+        "tier_1_only": "先只处理 1 档",
+        "tier_1_and_2": "建议先处理 1 档和 2 档",
+        "all_tiers": "可以直接处理全部档位",
+    }.get(summary.get("priority_tier_recommended_scope"), "先处理 1 档")
+
+    profile["recommended_first_action"] = recommended_scope
+    profile["user_summary"] = (
+        f"项目画像判定为“{profile.get('label', '通用项目')}”。"
+        f"固定进入 1 档的核心目录：{fixed_dirs}。"
+        f"按项目用途动态提升到 1 档的目录：{dynamic_dirs}。"
+        f"按项目用途动态提升到 1 档的根文件：{dynamic_root_files}。"
+        f"首轮建议优先查看：{focus_text}。"
+        f"{recommended_scope}。"
+    )
+    summary["project_profile"] = profile
 
 
 def _normalized_doc_name(filename: str) -> str:

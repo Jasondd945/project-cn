@@ -167,13 +167,21 @@ C:\work\A-CN\AAA-translate-output
 - 超大项目必须走 `manifest + progress` 双文件驱动，不能只靠上下文记忆。
 - `translate-manifest.json` 是稳定任务索引，负责给每个文件分配 `file_id` 和批次。
 - `translate-manifest.json` 还必须为每个文件分配 `priority_tier`，先把全项目抽象成 1 档、2 档、3 档，再决定处理范围。
+- 大项目评估时必须先生成 `summary.project_profile`，先由 AI 判断这个项目更像 skill、Web 应用、Python 应用、后端服务，还是通用工程，再决定哪些目录要动态提升。
+- `summary.project_profile.user_summary` 必须生成一段用户可读摘要，直接告诉后续 agent 这个项目被判断成什么类型、固定 1 档是什么、动态提升到 1 档的是什么、首轮先看什么。
+- `start`、`status`、`report`、`scope` 还必须拆分生成 `user_message` 和 `internal_reason`：
+- `user_message` 是可以直接发给用户的话。
+- `internal_reason` 是留给 agent 自己理解当前建议为什么成立的内部说明。
+- 为兼容旧调用，可以保留 `operator_advice`，但它只能等于 `user_message`，不能再混入内部判断。
 - `translate-progress.json` 是动态进度账本，负责记录 `pending`、`in_progress`、`completed`、`failed`、`skipped`。
 - 大项目评估时，必须先理解整个目录，再按“档位 + 文件类型”汇总，而不是直接扎进某个子目录开做。
 - 禁止靠记忆判断哪些文件已经处理过，哪些还没处理。
 - 禁止未读取 `translate-progress.json` 就继续下一批。
 - 下一批文件只能从进度账本里取，不能靠“我记得上次处理到哪了”。
 - 1 档、2 档、3 档内部都要继续区分 `document`、`code`、`other`，不能只按目录粗暴划分。
-- 1 档是“核心理解层”，优先放 README、CHANGELOG、CONTRIBUTING、LICENSE、核心 API、前后端入口脚本、核心依赖清单等。
+- 1 档是“核心理解层”，优先放 README、CHANGELOG、CONTRIBUTING、LICENSE、`agents/` 目录、核心 API、前后端入口脚本、核心依赖清单等。
+- `agents/` 目录属于固定进入 1 档的核心目录，不需要再等项目画像命中才提升。
+- `commands/`、`hooks/`、某些入口目录或根文件，允许根据 `summary.project_profile` 动态提升到 1 档；也就是说，有些内容永远在 1 档，有些内容要看项目用途再判定。
 - 2 档是“重要扩展层”，优先放 docs 目录中的重要说明、指南、参考文档、重要支撑代码和工具脚本。
 - 3 档是“外围噪声层”，优先放 tests、fixtures、examples、历史 plan 文档、archive、legacy、draft 等低优先级内容。
 - 默认自动开始 `1 档`。
@@ -196,14 +204,15 @@ C:\work\A-CN\AAA-translate-output
 
 1. `start` 生成 `translate-manifest.json`、`translate-progress.json`、`translate-originals-lock.json`
 2. 先读取 `summary.priority_tiers`
-3. 先向用户汇报 1 档、2 档、3 档的文件量，以及每档里的 `document`、`code`、`other`
-4. 如果 `priority_tier_decision_recommended = true`，默认自动开始 `1 档`
-5. `1 档` 完成后，必须暂停并让用户决定是否放开 `2 档`
-6. `2 档` 完成后，必须暂停并让用户决定是否放开 `3 档`
-7. 每处理完一个文件就更新一次进度账本
-8. 每满 20 个文件强制刷新一次 skill 规则
-9. 如中断，使用 `resume`
-10. 全部处理后，使用 `report`
+3. 再读取 `summary.project_profile`，看项目画像、识别信号、固定 1 档规则和动态提升规则
+4. 先向用户汇报 1 档、2 档、3 档的文件量，以及每档里的 `document`、`code`、`other`
+5. 如果 `priority_tier_decision_recommended = true`，默认自动开始 `1 档`
+6. `1 档` 完成后，必须暂停并让用户决定是否放开 `2 档`
+7. `2 档` 完成后，必须暂停并让用户决定是否放开 `3 档`
+8. 每处理完一个文件就更新一次进度账本
+9. 每满 20 个文件强制刷新一次 skill 规则
+10. 如中断，使用 `resume`
+11. 全部处理后，使用 `report`
 
 ## 标准流程
 

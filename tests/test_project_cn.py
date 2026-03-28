@@ -90,11 +90,13 @@ class ProjectCnTests(unittest.TestCase):
             src_root = Path(tmpdir) / "demo"
             (src_root / "docs" / "plans").mkdir(parents=True)
             (src_root / "src").mkdir(parents=True)
+            (src_root / "agents").mkdir(parents=True)
             (src_root / "tests").mkdir(parents=True)
 
             (src_root / "README.md").write_text("# Demo\n", encoding="utf-8")
             (src_root / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
             (src_root / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            (src_root / "agents" / "openai.yaml").write_text("model: test\n", encoding="utf-8")
             (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
             (src_root / "docs" / "plans" / "migration-plan.md").write_text("# Plan\n", encoding="utf-8")
             (src_root / "tests" / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
@@ -103,23 +105,64 @@ class ProjectCnTests(unittest.TestCase):
             items = {item["rel_path"]: item for item in result["items"]}
             tier_summary = result["summary"]["priority_tiers"]
             ordered_paths = [item["rel_path"] for item in result["items"]]
+            project_profile = result["summary"]["project_profile"]
 
             self.assertEqual(items["README.md"]["priority_tier"], 1)
             self.assertEqual(items["src/app.py"]["priority_tier"], 1)
             self.assertEqual(items["package.json"]["priority_tier"], 1)
+            self.assertEqual(items["agents/openai.yaml"]["priority_tier"], 1)
             self.assertEqual(items["docs/guide.md"]["priority_tier"], 2)
             self.assertEqual(items["docs/plans/migration-plan.md"]["priority_tier"], 3)
             self.assertEqual(items["tests/test_app.py"]["priority_tier"], 3)
 
             self.assertEqual(tier_summary["tier_1"]["document_files"], 1)
             self.assertEqual(tier_summary["tier_1"]["code_files"], 1)
-            self.assertEqual(tier_summary["tier_1"]["other_files"], 1)
+            self.assertEqual(tier_summary["tier_1"]["other_files"], 2)
             self.assertEqual(tier_summary["tier_2"]["document_files"], 1)
             self.assertEqual(tier_summary["tier_3"]["document_files"], 1)
             self.assertEqual(tier_summary["tier_3"]["code_files"], 1)
+            self.assertEqual(project_profile["primary_type"], "node-web-application")
+            self.assertIn("agents", project_profile["contextual_tier_1_dirs"])
+            self.assertIn("agents", project_profile["fixed_tier_1_dirs"])
+            self.assertIn("package.json", project_profile["dynamic_tier_1_root_files"])
+            self.assertIn("项目画像判定为", project_profile["user_summary"])
+            self.assertIn("可以直接处理全部档位", project_profile["recommended_first_action"])
 
             self.assertLess(ordered_paths.index("README.md"), ordered_paths.index("docs/guide.md"))
+            self.assertLess(ordered_paths.index("agents/openai.yaml"), ordered_paths.index("docs/guide.md"))
             self.assertLess(ordered_paths.index("docs/guide.md"), ordered_paths.index("tests/test_app.py"))
+
+    def test_assess_project_uses_project_profile_to_promote_skill_runtime_dirs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_root = Path(tmpdir) / "demo-skill"
+            (src_root / "agents").mkdir(parents=True)
+            (src_root / "commands").mkdir(parents=True)
+            (src_root / "hooks").mkdir(parents=True)
+            (src_root / "docs").mkdir(parents=True)
+
+            (src_root / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+            (src_root / "agents" / "openai.yaml").write_text("model: test\n", encoding="utf-8")
+            (src_root / "commands" / "help.md").write_text("# Help\n", encoding="utf-8")
+            (src_root / "hooks" / "before.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+            (src_root / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+
+            result = planning.assess_project(src_root)
+            items = {item["rel_path"]: item for item in result["items"]}
+            project_profile = result["summary"]["project_profile"]
+
+            self.assertEqual(project_profile["primary_type"], "agent-skill")
+            self.assertIn("commands", project_profile["contextual_tier_1_dirs"])
+            self.assertIn("hooks", project_profile["contextual_tier_1_dirs"])
+            self.assertIn("commands", project_profile["dynamic_tier_1_dirs"])
+            self.assertIn("hooks", project_profile["dynamic_tier_1_dirs"])
+            self.assertIn("skill.md", project_profile["contextual_tier_1_root_files"])
+            self.assertIn("skill.md", project_profile["dynamic_tier_1_root_files"])
+            self.assertEqual(items["SKILL.md"]["priority_tier"], 1)
+            self.assertEqual(items["commands/help.md"]["priority_tier"], 1)
+            self.assertEqual(items["hooks/before.sh"]["priority_tier"], 1)
+            self.assertEqual(items["docs/guide.md"]["priority_tier"], 2)
+            self.assertIn("项目画像", items["commands/help.md"]["priority_reason"])
+            self.assertIn("commands/help.md", project_profile["user_summary"])
 
     def test_prepare_project_copy_replaces_existing_destination_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -353,6 +396,10 @@ class ProjectCnTests(unittest.TestCase):
             self.assertTrue((output_dir / job_state.JOB_INFO_FILE).exists())
             self.assertEqual(job["next_batch"]["batch_index"], 1)
             self.assertEqual(len(job["next_batch"]["items"]), 2)
+            self.assertIn("项目画像判定为", job["project_profile_summary"])
+            self.assertIn("首轮优先关注", job["user_message"])
+            self.assertIn("当前下一步", job["internal_reason"])
+            self.assertEqual(job["operator_advice"], job["user_message"])
 
     def test_status_reads_progress_summary(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -366,6 +413,9 @@ class ProjectCnTests(unittest.TestCase):
             self.assertEqual(status["summary"]["in_progress_llm_files"], 1)
             self.assertEqual(status["current_batch"]["batch_index"], 1)
             self.assertEqual(status["refresh_checkpoint_count"], 1)
+            self.assertIn("项目画像判定为", status["project_profile_summary"])
+            self.assertIn("先完成当前这一批文件", status["user_message"])
+            self.assertIn("先完成这一批文件", status["internal_reason"])
 
     def test_status_reports_scope_gate_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -391,6 +441,7 @@ class ProjectCnTests(unittest.TestCase):
             self.assertFalse(status["awaiting_scope_decision"])
             self.assertEqual(status["next_action"], "finish_current_batch")
             self.assertIn("tier_2", status["remaining_priority_tiers"])
+            self.assertIn("先完成当前这一批文件", status["user_message"])
 
     def test_mark_updates_progress_after_each_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -484,6 +535,10 @@ class ProjectCnTests(unittest.TestCase):
             self.assertEqual(resumed["summary"]["next_locked_tier"], 2)
             self.assertEqual(resumed["summary"]["next_action"], "ask_user_about_tier_2")
 
+            status = job_runner.get_job_status(job["dst_root"])
+            self.assertIn("是否继续进入 2 档", status["user_message"])
+            self.assertIn("请先向用户确认是否进入 2 档", status["internal_reason"])
+
     def test_scope_decision_unlocks_tier_2_after_tier_1(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src_root = Path(tmpdir) / "demo"
@@ -510,6 +565,9 @@ class ProjectCnTests(unittest.TestCase):
 
             self.assertEqual(decision["selected_priority_scope"], job_state.SCOPE_TIER_1_AND_2)
             self.assertFalse(decision["summary"]["awaiting_scope_decision"])
+            self.assertIn("已放开 1+2 档", decision["user_message"])
+            self.assertIn("scope 决策为 `tier_1_and_2`", decision["internal_reason"])
+            self.assertEqual(decision["operator_advice"], decision["user_message"])
             self.assertEqual(resumed["next_batch"]["status"], "ready")
             self.assertEqual({item["rel_path"] for item in resumed["next_batch"]["items"]}, {"docs/guide.md"})
             self.assertEqual(resumed["summary"]["next_locked_tier"], 3)
@@ -541,9 +599,11 @@ class ProjectCnTests(unittest.TestCase):
                 Path(item["cn_file"]).write_text("generated\n", encoding="utf-8")
                 job_runner.mark_job_file(job["dst_root"], item["file_id"], status="completed")
 
-            job_runner.decide_job_scope(job["dst_root"], job_state.SCOPE_DECISION_SKIP_TIER_3)
+            decision = job_runner.decide_job_scope(job["dst_root"], job_state.SCOPE_DECISION_SKIP_TIER_3)
             report = job_runner.build_job_report(job["dst_root"])
 
+            self.assertIn("跳过 3 档", decision["user_message"])
+            self.assertIn("scope 决策为 `skip_tier_3`", decision["internal_reason"])
             self.assertEqual(report["status"], "complete_with_skipped_tiers")
             self.assertEqual(report["skipped_priority_tiers"], [3])
             self.assertEqual(report["missing_cn_files"], [])
@@ -600,10 +660,16 @@ class ProjectCnTests(unittest.TestCase):
             final_report_text = (output_dir / job_state.TEXT_REPORT_FILE).read_text(encoding="utf-8")
 
             self.assertEqual(report["status"], "ok")
+            self.assertIn("查看结果", report["user_message"])
+            self.assertIn("项目画像判定为", report["internal_reason"])
             self.assertTrue((output_dir / job_state.VERIFY_REPORT_FILE).exists())
             self.assertTrue((output_dir / job_state.TEXT_REPORT_FILE).exists())
             self.assertIn("=== 项目翻译结果报告 ===", final_report_text)
             self.assertIn("工作量摘要：", final_report_text)
+            self.assertIn("项目画像：", final_report_text)
+            self.assertIn("用户可读摘要：", final_report_text)
+            self.assertIn("对用户提示：", final_report_text)
+            self.assertIn("内部判断：", final_report_text)
             self.assertIn("优先级分档：", final_report_text)
             self.assertIn("范围闸门：", final_report_text)
             self.assertIn("1 档 核心理解层", final_report_text)
@@ -702,6 +768,13 @@ class ProjectCnTests(unittest.TestCase):
             "priority_tiers",
             "priority_tier_decision_recommended",
             "priority_tier_recommended_scope",
+            "项目画像",
+            "固定进入 1 档",
+            "动态提升到 1 档",
+            "`agents/` 目录",
+            "`user_message`",
+            "`internal_reason`",
+            "`operator_advice`",
             "默认自动开始 `1 档`",
             "`1 档` 完成后必须暂停并问用户是否进入 `2 档`",
             "用户选择必须通过状态命令写入作业文件",

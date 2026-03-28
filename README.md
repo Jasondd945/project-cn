@@ -19,8 +19,11 @@
 它是一个通用 skill，不绑定单一 agent，实现重点是：
 
 - 先完整评估，再执行
+- 开始时先做项目画像分析，再决定哪些目录固定进 1 档，哪些目录按项目用途动态提升
 - 大项目按 `1/2/3` 档分层推进
 - 支持 `status / resume / scope / mark / report`
+- `start / status / report` 都会输出用户可读的项目画像摘要
+- `start / status / report / scope` 会拆分输出 `user_message` 和 `internal_reason`
 - 支持中断续跑和结果校验
 - 不依赖外部翻译或注释 API
 
@@ -50,9 +53,14 @@ python "<skill_dir>/scripts/job_runner.py" report "<A-CN>"
 
 超大型项目会先按优先级分成三档：
 
-- `1 档`：核心理解层，例如 `README`、`CHANGELOG`、核心 API、前后端入口脚本
+- `1 档`：核心理解层，例如 `README`、`CHANGELOG`、`agents/`、核心 API、前后端入口脚本
 - `2 档`：重要扩展层，例如重要 `docs`、工具脚本、支撑代码
 - `3 档`：外围噪声层，例如 `tests`、`fixtures`、历史 plan、archive、draft
+
+分档不是纯目录表匹配，而是两层一起做：
+
+- 固定规则：`README`、`CHANGELOG`、`LICENSE`、`agents/` 这类固定进入 `1 档`
+- 动态规则：先做项目画像识别，再把 `commands/`、`hooks/`、入口目录或关键根文件按项目用途动态提升到 `1 档`
 
 默认规则：
 
