@@ -1,8 +1,8 @@
 # project-cn
 
-通用项目中文镜像 skill，适用于 Claude Code、Cursor、Gemini CLI 等支持 SKILL.md 规范的 AI 编程助手。
+> 通用项目中文镜像 skill — 一键将英文项目生成中文副本，原文零改动
 
-它会把原项目复制成同级 `-CN` 目录，保留原文件不覆盖，并为文档生成 `-CN` 翻译副本、为代码生成 `-CN` 中文注释增强副本。
+适用于 Claude Code、Cursor、Gemini CLI 等支持 SKILL.md 规范的 AI 编程助手。
 
 ## 使用场景
 
@@ -18,34 +18,24 @@
 
 ## 安装
 
-### 方式一：Skills CLI（推荐）
+### Skills CLI（推荐）
 
-```bash
-npx skills add Jasondd945/project-cn
+| 用途 | 命令 |
+|------|------|
+| 项目级安装 | `npx skills add Jasondd945/project-cn` |
+| 全局安装 | `npx skills add Jasondd945/project-cn -g` |
+| 安装指定 skill | `npx skills add Jasondd945/project-cn --skill project-cn` |
+| 验证安装 | `npx skills list` |
+| 卸载 | `npx skills remove project-cn` |
+
+### 手动安装
+
+将以下目录复制到 `.claude/skills/project-cn/` 下：
+
 ```
-
-```bash
-npx skills add Jasondd945/project-cn -g
-```
-
-```bash
-npx skills add Jasondd945/project-cn --skill project-cn
-```
-
-### 方式二：手动
-
-将 `SKILL.md`、`scripts/`、`references/` 复制到你的 `.claude/skills/project-cn/` 下。
-
-### 验证安装
-
-```bash
-npx skills list
-```
-
-### 卸载
-
-```bash
-npx skills remove project-cn
+SKILL.md
+scripts/
+references/
 ```
 
 ## 核心能力
@@ -58,10 +48,6 @@ npx skills remove project-cn
 - 已完成文件默认只保留元数据，不再把全文反复带回上下文
 - 提供有界 `headless_runner` 调度器，负责 `start / resume` 和停机条件，不负责替代模型翻译
 
-## 贡献
-
-欢迎提交 issue 和 pull request。开始之前，先看 [CONTRIBUTING.md](./CONTRIBUTING.md)。
-
 ## 许可证
 
-本项目采用 [MIT License](./LICENSE)。
+[MIT](./LICENSE)
