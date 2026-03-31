@@ -164,20 +164,32 @@ C:\work\A-CN\AAA-translate-output
 
 当项目规模很大、轮次很多、可能跨多次会话或多个 agent 处理时，必须使用下面这套硬协议：
 
+状态与证据：
+
 - 超大项目必须走 `manifest + progress` 双文件驱动，不能只靠上下文记忆。
-- `translate-manifest.json` 是稳定任务索引，负责给每个文件分配 `file_id` 和批次。
-- `translate-manifest.json` 还必须为每个文件分配 `priority_tier`，先把全项目抽象成 1 档、2 档、3 档，再决定处理范围。
+- `translate-manifest.json` 是稳定任务索引，负责 `file_id`、批次和 `priority_tier`；`translate-progress.json` 是动态进度账本，负责记录 `pending`、`in_progress`、`completed`、`failed`、`skipped`。
+- `translate-originals-lock.json` 用来保护源目录和复制后的原始文件；最终 `report` 必须校验这两个区域有没有被误改。
+- 预检优先于批量执行；如果 `preflight_summary` 还没读完，不得直接进入整批处理。
+- 不信任子代理自报完成；只有 `mark` 之后的磁盘结果和最终 `report` 才算有效证据。
+- 禁止绕过自动化脚本；必须通过 `job_runner.py`、`verify_outputs.py`、`headless_runner.py` 这些正式入口推进状态机。
+- 禁止将调试/报告文件写到项目根目录；像 `scan_result.json`、`final_report.json`、`translate-*.json`、`translate-*.txt` 这类运行时产物只能进入 `A-CN/AAA-translate-output`。
+- `verify_outputs.py` 除了校验目标目录结果，还必须检测 `source_root_pollution`，用于发现运行时文件被误写回源目录。
+
+上下文装载：
+
+- `status.summary.context_usage_hint` 是上下文装载控制提示，后续 agent 每次继续任务前都必须先读。
+- `context_usage_hint.completed_file_context_policy` 必须视为硬约束；默认策略是 `metadata-only-unless-explicit-reopen`。
+- 已完成文件默认只保留 `file_id`、`rel_path`、`category`、`status` 等元数据，禁止把 `copied_file` 或 `cn_file` 的全文再次带进上下文。
+- 只有在校验失败、单文件排障或用户明确要求回看某个已完成文件时，才允许显式重开该文件；而且只能按单文件最小范围读取，不得把历史完成文件整批重新装入上下文。
+- 恢复下一批时，默认只读取 `translate-progress.json`、`translate-manifest.json`、`SKILL.md`、规则文件以及当前批次待处理文件，不回灌已完成文件全文。
+- 下一批文件只能从进度账本里取；禁止靠记忆判断哪些文件已经处理过，哪些还没处理；禁止未读取 `translate-progress.json` 就继续下一批。
+
+分档与用户闸门：
+
+- 大项目评估时必须先理解整个目录，再按“档位 + 文件类型”汇总，而不是直接扎进某个子目录开做。
 - 大项目评估时必须先生成 `summary.project_profile`，先由 AI 判断这个项目更像 skill、Web 应用、Python 应用、后端服务，还是通用工程，再决定哪些目录要动态提升。
 - `summary.project_profile.user_summary` 必须生成一段用户可读摘要，直接告诉后续 agent 这个项目被判断成什么类型、固定 1 档是什么、动态提升到 1 档的是什么、首轮先看什么。
-- `start`、`status`、`report`、`scope` 还必须拆分生成 `user_message` 和 `internal_reason`：
-- `user_message` 是可以直接发给用户的话。
-- `internal_reason` 是留给 agent 自己理解当前建议为什么成立的内部说明。
-- 为兼容旧调用，可以保留 `operator_advice`，但它只能等于 `user_message`，不能再混入内部判断。
-- `translate-progress.json` 是动态进度账本，负责记录 `pending`、`in_progress`、`completed`、`failed`、`skipped`。
-- 大项目评估时，必须先理解整个目录，再按“档位 + 文件类型”汇总，而不是直接扎进某个子目录开做。
-- 禁止靠记忆判断哪些文件已经处理过，哪些还没处理。
-- 禁止未读取 `translate-progress.json` 就继续下一批。
-- 下一批文件只能从进度账本里取，不能靠“我记得上次处理到哪了”。
+- `start`、`status`、`report`、`scope` 必须同时给出 `user_message` 和 `internal_reason`；为兼容旧调用，可以保留 `operator_advice`，但它只能等于 `user_message`。
 - 1 档、2 档、3 档内部都要继续区分 `document`、`code`、`other`，不能只按目录粗暴划分。
 - 1 档是“核心理解层”，优先放 README、CHANGELOG、CONTRIBUTING、LICENSE、`agents/` 目录、核心 API、前后端入口脚本、核心依赖清单等。
 - `agents/` 目录属于固定进入 1 档的核心目录，不需要再等项目画像命中才提升。
@@ -189,16 +201,21 @@ C:\work\A-CN\AAA-translate-output
 - `2 档` 完成后必须暂停并问用户是否进入 `3 档`。
 - 用户选择必须通过状态命令写入作业文件，不能只靠聊天记忆。
 - 对于超大型项目，agent 不得默认从 3 档开始，也不得在未经确认的情况下直接把 1/2/3 档全部跑完。
+
+批次、验证与并行：
+
+- 超大任务按批次推进，不做超大会话；宁可多轮 `resume`，也不要在一个超长上下文里硬撑到结束。
 - 默认每 20 个文件强制刷新一次规则文件，并重新读取 `SKILL.md`、`references/document-rules.md`、`references/code-rules.md`、`translate-progress.json`、`translate-manifest.json`。
-- 默认按批次顺序推进，不默认并行；多子智能体并行只作为可选模式。
-- 如果启用多子智能体，所有子智能体必须共享同一个 `AAA-translate-output` 状态目录。
-- 如果启用多子智能体，必须先明确每个子智能体的文件归属，避免写入冲突。
-- 并行模式下由主 agent 负责切批、汇总结果和最终校验。
-- 文档和代码都只能写 `cn_file`，不得改 `copied_file`，不得改源目录 `A`。
-- 用 plain text 再强调一次：不得改 copied_file，不得改源目录。
 - `resume` 只能继续 `pending` 或显式允许重试的 `failed`，`completed` 不得重跑。
 - 每处理完一个文件，就要立刻把结果落盘到 `translate-progress.json`，不能等整批结束再统一回写。
-- `translate-originals-lock.json` 用来保护源目录和复制后的原始文件；最终 `report` 必须校验这两个区域有没有被误改。
+- 文档和代码都只能写 `cn_file`，不得改 `copied_file`，不得改源目录 `A`。
+- 这条规则用 plain text 再写一次：不得改 copied_file，不得改源目录。
+- 如果一个批次拆给多个子代理，每个子代理在接手自己的 `file_id` 后，必须立刻回写一次 `heartbeat`，后续按固定间隔继续回写子代理心跳。
+- 主 agent 或调度器必须定时运行 `watchdog` 巡检活跃批次，确认子代理没有卡住；不要等到整批超时后才发现问题。
+- 如果 `watchdog` 发现首次心跳缺失、心跳超时或子代理卡住，必须先介入处理卡住项，再决定是否重分配文件或继续当前批次。
+- `watchdog` 的返回结果里必须包含 `recommended_actions` 建议动作清单；主 agent 先按这份清单做介入、重分配或替换子代理，不要自己凭印象猜下一步。
+- 默认按批次顺序推进，不默认并行；多子智能体并行只作为可选模式。
+- 如果启用多子智能体，所有子智能体必须共享同一个 `AAA-translate-output` 状态目录，先明确文件归属，再由主 agent 负责切批、汇总结果和最终校验。
 
 推荐大项目执行顺序：
 
@@ -272,6 +289,14 @@ python "<skill_dir>\scripts\job_runner.py" start "<src_root>"
 - `priority_tier_decision_recommended`
 - `priority_tier_recommended_scope`
 
+同时必须读取 `summary.preflight_summary`，至少检查：
+
+- `preflight_summary.source_root_signature`
+- `preflight_summary.hidden_dir_count`
+- `preflight_summary.candidate_output_root`
+- `preflight_summary.requires_user_confirmation`
+- `preflight_summary.confirmation_reason`
+
 ### 3. 判断是否需要先提醒用户
 
 当 `requires_confirmation = true` 或 `priority_tier_decision_recommended = true` 时，必须先告诉用户：
@@ -285,6 +310,13 @@ python "<skill_dir>\scripts\job_runner.py" start "<src_root>"
 - 推荐范围是 `priority_tier_recommended_scope` 指向的哪一档组合。
 - 如果只是“档位闸门建议”，默认先跑 `1 档`，不要在一开始就默认放开 `2/3 档`。
 - 当 `1 档` 跑完后，再让用户明确选择：`只做 1 档`、`先做 1+2 档`、`全部 1+2+3 档`、或显式跳过 `3 档`。
+
+当 `preflight_summary.requires_user_confirmation = true` 时，还必须额外说明：
+
+- `source_root_signature` 看到的顶层目录和顶层文件是什么。
+- 当前候选输出目录 `candidate_output_root` 是什么。
+- 为什么判定这可能是包装层、容易误读的根目录，或顶层结构异常。
+- 在用户确认前，不要把“唯一子目录”偷换成新的项目根目录。
 
 如果 `requires_confirmation = false` 且 `priority_tier_decision_recommended = false`，直接继续，不要额外拖延。
 
@@ -343,6 +375,23 @@ python "<skill_dir>\scripts\job_runner.py" scope "<A-CN>" --decision all_tiers
 python "<skill_dir>\scripts\job_runner.py" scope "<A-CN>" --decision skip_tier_3
 ```
 
+如果是多子智能体并行处理，每个子智能体接手文件后必须立即回写心跳：
+
+```powershell
+python "<skill_dir>\scripts\job_runner.py" heartbeat "<A-CN>" worker-1 F000001 F000002 --note "正在处理文档批次"
+```
+
+主 agent 必须定时做一次 `watchdog` 巡检，确认子代理仍在正常工作，而不是已经卡住：
+
+```powershell
+python "<skill_dir>\scripts\job_runner.py" watchdog "<A-CN>"
+```
+
+如果 `watchdog` 返回了 `recommended_actions`，主 agent 下一步应优先执行这份建议动作清单，而不是继续放行下一批：
+
+- `check_or_replace_worker`：先检查对应子代理是否还在运行；若没有恢复心跳，就回收对应 `file_id` 并重分配。
+- `reassign_unclaimed_files`：说明文件已经进入 `in_progress`，但直到现在还没有首个心跳；应立即确认是否漏分配，并重新派发。
+
 每处理完一个 `file_id` 对应的文件后，必须立刻写回状态：
 
 ```powershell
@@ -358,6 +407,7 @@ python "<skill_dir>\scripts\job_runner.py" mark "<A-CN>" "<file_id>" --status fa
 硬约束：
 
 - 不允许口头记忆“处理到哪里了”，只能以 `translate-progress.json` 为准。
+- 每次 `status`、`resume` 或跨会话继续前，必须先读取 `context_usage_hint`，确认本轮允许带入上下文的内容范围。
 - `status` 用来读状态，`resume` 用来取下一批，`scope` 用来写用户档位决定，`mark` 用来逐文件落盘；四者缺一不可。
 - 若启用多子智能体，主 agent 也必须要求每个子智能体按 `file_id` 回报完成状态，再统一调用 `mark` 回写。
 
@@ -426,6 +476,8 @@ python "<skill_dir>\scripts\job_runner.py" mark "<A-CN>" "<file_id>" --status fa
 - 主 agent 按批次切分任务，再把不同批次分配给多个子智能体。
 - 每个子智能体只处理自己负责的 `cn_file`，不回写原文件，也不改其他批次的 `-CN` 文件。
 - 每个子智能体都必须明确自己的文件归属，不能抢写、重写或覆盖别人的输出。
+- 每个子智能体接手文件后，先回写一次 `heartbeat`；如果主 agent 超过一段时间没看到新的子代理心跳，就必须运行 `watchdog` 判断是否已经卡住。
+- `watchdog` 不只是检测器，还必须返回 `recommended_actions` 建议动作清单，让主 agent 直接知道该介入哪些 `file_id`、哪些 `worker_id`。
 - 如果同时存在文档和代码任务，优先拆成“文档批次”和“代码批次”，再在各自内部继续分片。
 
 推荐分片策略：
@@ -446,6 +498,8 @@ python "<skill_dir>\scripts\job_runner.py" mark "<A-CN>" "<file_id>" --status fa
 - 每个子智能体返回自己完成的文件数、失败文件数、失败原因和未处理项。
 - 主 agent 负责汇总所有子智能体结果，统一去重失败项，并生成最终报告。
 - 主 agent 在全部子智能体完成后，统一运行 `verify_outputs.py` 做结果核验。
+- 如果 `watchdog` 已经把某个子代理或某组文件标记为卡住，主 agent 必须先介入、重分配或终止该子代理，不要继续等待整批自然结束。
+- 如果 `watchdog` 已经返回建议动作清单，主 agent 先执行这些建议动作，再决定是否继续当前批次或重新分配文件。
 
 ### 10. 最后做结果校验
 
@@ -550,13 +604,9 @@ python "<skill_dir>\scripts\job_runner.py" report "<A-CN>\AAA-translate-output"
 - `shell CN 副本生成` / 中文注释写回：不要通过 PowerShell 内联脚本直接塞入中文注释文本再写 shell 文件，这会在非 UTF-8 控制台下把中文降成 `?`；优先用 `apply_patch` 直接写文件，或确保整条生成链路显式使用 UTF-8。
 - `代码 CN 副本清洗` / 符号乱码判断：先区分 `?$`、`[]?`、`.*?` 这类语法元字符与真正的显示乱码；如果是原脚本里本该显示为符号或 emoji 的提示文本发生 mojibake，可以只修复显示字符串为可读符号或 ASCII，不要改条件、命令、变量、正则和控制流。
 - `根目录判定` / 单子目录包装壳：即使源目录下面只有一个子目录，也必须坚持“精确使用用户给出的路径”这一规则，输出应是 `A-CN`，不能偷换成 `child-CN`。
-- `额外产物落点` / 低层输出：`prepare_job.py --output` 和 `job_runner.py report --output` 都不能写回源目录；如果需要显式导出，只能写到 `A-CN/AAA-translate-output` 或源目录之外的其他位置。
+- `额外产物落点` / 低层输出与调试文件：`prepare_job.py --output`、`job_runner.py report --output` 和临时调试 JSON 都不能写回源目录；显式导出时只能写到 `A-CN/AAA-translate-output` 或源目录之外的位置。
 - `Python 缓存` / skill 清洁度：入口脚本、模块文件和测试文件都要默认禁用 `.pyc` 写盘；交付前清理 skill 目录内的 `__pycache__`。
-- `文件扫描` / 禁止手工脑补分类：不要用可能漏掉隐藏目录的手工扫描替代 `translate-manifest.json`；点开头路径、无扩展名文档、法律/声明/说明类文档都必须按清单处理，不能靠人工主观排除。
+- `文件扫描` / 隐藏目录与 A 类文档：不要用可能漏掉隐藏目录的手工扫描替代 `translate-manifest.json`；点开头路径、无扩展名文档，以及 README、CHANGELOG、CONTRIBUTING、LICENSE 这类 A 类文档都必须按清单处理，不能靠人工主观排除。
 - `SKILL.md / Windows 控制台编码显示`：如果 `Get-Content` 读出的中文技能正文出现 mojibake，优先改用显式 `UTF-8` 的内联 Python 读取，不要在乱码文本上继续执行翻译规则。
 - `translate-manifest.json / 字段名探测`：读取清单前先打印首个 `item` 的键集合，确认实际字段是 `rel_path`、`cn_rel_path` 还是其他命名，再批量消费，避免把固定假设写死成 `relative_path`。
-- `项目扫描 / 隐藏目录遗漏`：使用 Glob 扫描项目时，`**/*` 模式默认会跳过以 `.` 开头的隐藏目录（如 `.claude-plugin`、`.git` 等）。必须显式扫描这些隐藏目录，或在复制阶段直接使用 `cp -r` 复制整个源目录（包括隐藏文件）。下次扫描前先检查是否有 `.claude-plugin`、`.github`、`.vscode` 等常见隐藏目录。
-- `绕过脚本手动处理 / 致命错误`：**禁止绕过 `job_runner.py` 脚本直接手动处理**。手动处理会导致：1) 遗漏隐藏目录（如 `.claude-plugin`），2) 错误判断文件分类（如误以为 LICENSE 不需要翻译），3) 无法生成 manifest 清单导致无法验证完整性。如果脚本不存在，立即报错停止，不得手动替代。
-- `文件分类错误 / LICENSE 遗漏`：LICENSE 明确属于 A 类文档文件（技能规范第 92 行明确列出），必须生成 `LICENSE-CN` 副本。不得因为"法律文件""标准模板"等主观判断而跳过。所有 A 类文件（README、CHANGELOG、CONTRIBUTING、LICENSE、NOTES、GUIDE、FAQ、MANUAL）都必须翻译。
 - `子代理路径错误 / 文件位置偏离`：子代理在处理 -CN 文件时，可能使用相对路径导致文件被写入错误位置（如项目根目录的 `skills/` 而非 `A-CN/skills/`）。**对策**：1) 为子代理提供完整的绝对目标路径；2) 任务完成后检查生成的文件位置；3) 清理错误位置的重复文件；4) 在任务说明中明确指定输出路径格式。
-- `临时调试产物 / 源目录污染`：主 agent 在调试 report 输出格式时，不应将中间 JSON 文件（如 `final_report.json`）重定向到源目录 `A` 或项目根目录。**对策**：1) 所有中间产物一律写到系统临时目录或 `A-CN/AAA-translate-output`；2) 调试完成后立即清理临时文件；3) 需要导出报告时只用 `job_runner.py report --output` 指定 `A-CN/AAA-translate-output` 内路径。

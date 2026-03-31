@@ -297,6 +297,7 @@ def assess_project(
 
     summary["excluded_dirs"] = sorted(skipped_dir_names)
     _finalize_summary(summary)
+    _set_preflight_summary(summary, src_path, dst_path, excluded_dir_names)
 
     return {
         "src_root": str(src_path),
@@ -418,6 +419,8 @@ def _empty_summary(batch_size: int) -> dict:
         "root_interpretation": "exact-user-path",
         "top_level_files": 0,
         "top_level_dirs": 0,
+        "top_level_file_names": [],
+        "top_level_dir_names": [],
         "single_child_wrapper_detected": False,
         "total_files": 0,
         "document_files": 0,
@@ -455,22 +458,27 @@ def _empty_summary(batch_size: int) -> dict:
             "skip_tier_3",
         ],
         "project_profile": _empty_project_profile(),
+        "preflight_summary": {},
     }
 
 
 def _set_root_summary(summary: dict, src_path: Path) -> None:
-    top_level_dirs = 0
-    top_level_files = 0
+    top_level_dir_names: list[str] = []
+    top_level_file_names: list[str] = []
 
     for child in src_path.iterdir():
         if child.is_dir():
-            top_level_dirs += 1
+            top_level_dir_names.append(child.name)
         elif child.is_file():
-            top_level_files += 1
+            top_level_file_names.append(child.name)
 
-    summary["top_level_dirs"] = top_level_dirs
-    summary["top_level_files"] = top_level_files
-    summary["single_child_wrapper_detected"] = top_level_dirs == 1 and top_level_files == 0
+    top_level_dir_names.sort()
+    top_level_file_names.sort()
+    summary["top_level_dirs"] = len(top_level_dir_names)
+    summary["top_level_files"] = len(top_level_file_names)
+    summary["top_level_dir_names"] = top_level_dir_names
+    summary["top_level_file_names"] = top_level_file_names
+    summary["single_child_wrapper_detected"] = len(top_level_dir_names) == 1 and len(top_level_file_names) == 0
 
 
 def _update_summary(summary: dict, item: dict) -> None:
@@ -547,6 +555,66 @@ def _finalize_summary(summary: dict) -> None:
     summary["priority_tier_recommended_scope"] = _recommended_tier_scope(summary)
     summary["requires_confirmation"] = bool(risk_flags)
     _finalize_project_profile(summary)
+
+
+def _set_preflight_summary(
+    summary: dict,
+    src_path: Path,
+    dst_path: Path,
+    excluded_dir_names: set[str],
+) -> None:
+    hidden_dir_count, hidden_dir_examples = _collect_hidden_dir_details(src_path, excluded_dir_names)
+    confirmation_reason = _build_confirmation_reason(summary)
+
+    summary["preflight_summary"] = {
+        "source_root_signature": {
+            "src_root": str(src_path),
+            "top_level_dirs": list(summary.get("top_level_dir_names", [])),
+            "top_level_files": list(summary.get("top_level_file_names", [])),
+        },
+        "hidden_dir_count": hidden_dir_count,
+        "hidden_dir_examples": hidden_dir_examples,
+        "single_child_wrapper_detected": summary.get("single_child_wrapper_detected", False),
+        "candidate_output_root": str(dst_path),
+        "requires_user_confirmation": confirmation_reason is not None,
+        "confirmation_reason": confirmation_reason,
+    }
+
+
+def _collect_hidden_dir_details(src_path: Path, excluded_dir_names: set[str]) -> tuple[int, list[str]]:
+    hidden_dir_count = 0
+    hidden_dir_examples: list[str] = []
+    skipped_dir_names: set[str] = set()
+
+    for directory in _iter_directories(src_path, excluded_dir_names, skipped_dir_names):
+        if directory == src_path:
+            continue
+        if not directory.name.startswith("."):
+            continue
+
+        hidden_dir_count += 1
+        rel_path = directory.relative_to(src_path).as_posix()
+        if len(hidden_dir_examples) < 5:
+            hidden_dir_examples.append(rel_path)
+
+    return hidden_dir_count, hidden_dir_examples
+
+
+def _build_confirmation_reason(summary: dict) -> str | None:
+    has_large_project_risk = bool(summary.get("requires_confirmation")) or bool(
+        summary.get("priority_tier_decision_recommended")
+    )
+    abnormal_top_level_shape = summary.get("top_level_files", 0) == 0 and summary.get("top_level_dirs", 0) <= 2
+
+    if summary.get("single_child_wrapper_detected"):
+        if has_large_project_risk:
+            return "single-child-wrapper-and-large-project"
+        return "single-child-wrapper-detected"
+
+    if has_large_project_risk and abnormal_top_level_shape:
+        return "large-project-with-abnormal-top-level-shape"
+
+    return None
 
 
 def _utc_timestamp() -> str:

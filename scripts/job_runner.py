@@ -62,7 +62,9 @@ def start_job(
         "src_root": manifest["src_root"],
         "dst_root": manifest["dst_root"],
         "summary": manifest["summary"],
+        "preflight_summary": manifest["summary"].get("preflight_summary", {}),
         "progress_summary": progress["summary"],
+        "context_usage_hint": progress["summary"].get("context_usage_hint", {}),
         "project_profile": manifest["summary"].get("project_profile", {}),
         "project_profile_summary": manifest["summary"].get("project_profile", {}).get("user_summary"),
         "user_message": guidance["user_message"],
@@ -86,12 +88,23 @@ def resume_job(job_ref: str | Path, retry_failed: bool = False) -> dict:
     batch = job_state.checkout_next_batch(progress, retry_failed=retry_failed)
     job_state.atomic_write_json(job_dir / job_state.PROGRESS_FILE, progress)
     job_info = job_state.load_json_if_exists(job_dir / job_state.JOB_INFO_FILE)
+    manifest = job_state.load_json(job_dir / job_state.MANIFEST_FILE)
+    guidance = _build_runtime_guidance(manifest.get("summary", {}), progress["summary"])
+    decision_evidence = job_state.build_decision_evidence(progress, batch)
 
     return {
         "job_id": job_info.get("job_id", job_dir.name),
         "job_dir": str(job_dir),
         "progress_path": str(job_dir / job_state.PROGRESS_FILE),
         "summary": progress["summary"],
+        "context_usage_hint": progress["summary"].get("context_usage_hint", {}),
+        "watchdog": progress["summary"].get("watchdog", {}),
+        "batch_selection_reason_code": decision_evidence.get("batch_selection_reason_code"),
+        "batch_selection_reason": decision_evidence.get("batch_selection_reason"),
+        "decision_evidence": decision_evidence,
+        "user_message": guidance["user_message"],
+        "internal_reason": guidance["internal_reason"],
+        "operator_advice": guidance["user_message"],
         "next_batch": batch,
     }
 
@@ -121,6 +134,9 @@ def get_job_status(job_ref: str | Path) -> dict:
     job_info = job_state.load_json_if_exists(job_dir / job_state.JOB_INFO_FILE)
     progress = job_state.load_json(job_dir / job_state.PROGRESS_FILE)
     manifest = job_state.load_json(job_dir / job_state.MANIFEST_FILE)
+    if progress.get("active_batch"):
+        job_state.run_watchdog_check(progress, source="status")
+        job_state.atomic_write_json(job_dir / job_state.PROGRESS_FILE, progress)
 
     active_batch = progress.get("active_batch")
     if active_batch:
@@ -132,6 +148,7 @@ def get_job_status(job_ref: str | Path) -> dict:
     else:
         current_batch = None
     guidance = _build_runtime_guidance(manifest.get("summary", {}), progress["summary"])
+    decision_evidence = job_state.build_decision_evidence(progress)
 
     return {
         "job_id": job_info.get("job_id", job_dir.name),
@@ -139,11 +156,17 @@ def get_job_status(job_ref: str | Path) -> dict:
         "src_root": manifest["src_root"],
         "dst_root": manifest["dst_root"],
         "summary": progress["summary"],
+        "preflight_summary": manifest.get("summary", {}).get("preflight_summary", {}),
+        "context_usage_hint": progress["summary"].get("context_usage_hint", {}),
+        "watchdog": progress["summary"].get("watchdog", {}),
         "project_profile": manifest.get("summary", {}).get("project_profile", {}),
         "project_profile_summary": manifest.get("summary", {}).get("project_profile", {}).get("user_summary"),
         "user_message": guidance["user_message"],
         "internal_reason": guidance["internal_reason"],
         "operator_advice": guidance["user_message"],
+        "next_action_reason_code": decision_evidence.get("next_action_reason_code"),
+        "next_action_reason": decision_evidence.get("next_action_reason"),
+        "decision_evidence": decision_evidence,
         "current_batch": current_batch,
         "next_pending_batch_index": progress["summary"].get("next_pending_batch_index"),
         "refresh_checkpoint_count": progress["summary"].get("refresh_checkpoint_count", 0),
@@ -173,6 +196,48 @@ def mark_job_file(
     }
 
 
+def heartbeat_job_files(
+    job_ref: str | Path,
+    worker_id: str,
+    file_ids: list[str],
+    note: str | None = None,
+) -> dict:
+    job_dir = job_state.resolve_job_dir(job_ref)
+    progress = job_state.load_json(job_dir / job_state.PROGRESS_FILE)
+    heartbeat = job_state.heartbeat_items(progress, file_ids=file_ids, worker_id=worker_id, note=note)
+    job_state.atomic_write_json(job_dir / job_state.PROGRESS_FILE, progress)
+    return {
+        "job_dir": str(job_dir),
+        "worker_id": worker_id,
+        "file_ids": heartbeat["file_ids"],
+        "checked_at": heartbeat["checked_at"],
+        "summary": progress["summary"],
+        "watchdog": progress["summary"].get("watchdog", {}),
+    }
+
+
+def watchdog_job(job_ref: str | Path) -> dict:
+    job_dir = job_state.resolve_job_dir(job_ref)
+    job_info = job_state.load_json_if_exists(job_dir / job_state.JOB_INFO_FILE)
+    progress = job_state.load_json(job_dir / job_state.PROGRESS_FILE)
+    manifest = job_state.load_json(job_dir / job_state.MANIFEST_FILE)
+    watchdog = job_state.run_watchdog_check(progress, source="manual")
+    job_state.atomic_write_json(job_dir / job_state.PROGRESS_FILE, progress)
+    guidance = _build_runtime_guidance(manifest.get("summary", {}), progress["summary"])
+    decision_evidence = job_state.build_decision_evidence(progress)
+    return {
+        "job_id": job_info.get("job_id", job_dir.name),
+        "job_dir": str(job_dir),
+        "summary": progress["summary"],
+        "watchdog": watchdog,
+        "context_usage_hint": progress["summary"].get("context_usage_hint", {}),
+        "user_message": guidance["user_message"],
+        "internal_reason": guidance["internal_reason"],
+        "operator_advice": guidance["user_message"],
+        "decision_evidence": decision_evidence,
+    }
+
+
 def build_job_report(job_ref: str | Path) -> dict:
     job_dir = job_state.resolve_job_dir(job_ref)
     manifest = job_state.load_json(job_dir / job_state.MANIFEST_FILE)
@@ -197,6 +262,7 @@ def build_job_report(job_ref: str | Path) -> dict:
         or verify_report["modified_source_files"]
         or verify_report["modified_original_copies"]
         or verify_report["missing_cn_files"]
+        or verify_report["source_root_pollution"]
         or unfinished_in_scope
     ):
         status = "incomplete"
@@ -217,12 +283,17 @@ def build_job_report(job_ref: str | Path) -> dict:
         "src_root": manifest["src_root"],
         "dst_root": manifest["dst_root"],
         "summary": manifest.get("summary", {}),
+        "preflight_summary": manifest.get("summary", {}).get("preflight_summary", {}),
+        "context_usage_hint": progress_summary.get("context_usage_hint", {}),
+        "watchdog": progress_summary.get("watchdog", {}),
         "project_profile": manifest.get("summary", {}).get("project_profile", {}),
         "project_profile_summary": manifest.get("summary", {}).get("project_profile", {}).get("user_summary"),
         "user_message": guidance["user_message"],
         "internal_reason": guidance["internal_reason"],
         "operator_advice": guidance["user_message"],
         "progress_summary": progress_summary,
+        "batch_verifications": verify_report.get("batch_verifications", []),
+        "active_batch_verification": verify_report.get("active_batch_verification", {}),
         "generated": verify_report["generated"],
         "missing_original_copies": verify_report["missing_original_copies"],
         "missing_cn_files": verify_report["missing_cn_files"],
@@ -230,6 +301,8 @@ def build_job_report(job_ref: str | Path) -> dict:
         "modified_original_copies": verify_report["modified_original_copies"],
         "source_integrity_ok": verify_report["source_integrity_ok"],
         "copied_original_integrity_ok": verify_report["copied_original_integrity_ok"],
+        "source_root_pollution": verify_report["source_root_pollution"],
+        "source_root_pollution_detected": verify_report["source_root_pollution_detected"],
         "selected_priority_scope": progress_summary.get("selected_priority_scope"),
         "selected_priority_scope_label": progress_summary.get("selected_priority_scope_label"),
         "scope_finalized": progress_summary.get("scope_finalized", False),
@@ -353,6 +426,10 @@ def _format_text_report(report: dict) -> str:
         f"- 当前范围内待处理 LLM 文件：{progress_summary.get('pending_llm_files_in_scope', 0)}",
         f"- 当前范围内失败 LLM 文件：{progress_summary.get('failed_llm_files_in_scope', 0)}",
         f"- 刷新检查点数：{progress_summary.get('refresh_checkpoint_count', 0)}",
+        f"- 子代理巡检状态：{progress_summary.get('watchdog_status', 'unknown')}",
+        f"- 需要介入的卡住文件数：{progress_summary.get('stale_in_progress_file_count', 0)}",
+        f"- 需要介入的子代理数：{progress_summary.get('stale_worker_count', 0)}",
+        f"- watchdog 建议动作数：{progress_summary.get('recommended_watchdog_action_count', 0)}",
         "",
         "产出结果：",
         f"- 已确认存在的原始复制文件：{generated.get('original_copied_files_present', 0)}",
@@ -366,7 +443,20 @@ def _format_text_report(report: dict) -> str:
         f"- 复制后原始文件完整性：{copied_integrity}",
         f"- 被修改的源文件数：{len(report.get('modified_source_files', []))}",
         f"- 被修改的原始复制文件数：{len(report.get('modified_original_copies', []))}",
+        f"- 源目录污染项数：{len(report.get('source_root_pollution', []))}",
     ]
+
+    recommended_actions = progress_summary.get("recommended_watchdog_actions", [])
+    if recommended_actions:
+        lines.extend(["", "watchdog 建议动作："])
+        for action in recommended_actions:
+            worker_text = action.get("worker_id") or "未绑定子代理"
+            file_ids = "、".join(action.get("file_ids", [])) or "无"
+            reason_summary = action.get("reason_summary", "无")
+            instruction = action.get("instruction", "无")
+            lines.append(
+                f"- [{action.get('action', 'unknown')}] worker={worker_text} files={file_ids}；异常：{reason_summary}；建议：{instruction}"
+            )
 
     if report.get("missing_cn_files"):
         lines.extend(["", "缺失的 -CN 文件："])
@@ -386,6 +476,11 @@ def _format_text_report(report: dict) -> str:
     if report.get("modified_original_copies"):
         lines.extend(["", "被修改的原始复制文件："])
         for item in report["modified_original_copies"]:
+            lines.append(f"- {item['rel_path']} ({item['reason']})")
+
+    if report.get("source_root_pollution"):
+        lines.extend(["", "源目录污染："])
+        for item in report["source_root_pollution"]:
             lines.append(f"- {item['rel_path']} ({item['reason']})")
 
     return "\n".join(lines) + "\n"
@@ -417,6 +512,8 @@ def _format_remaining_tier_line(label: str, tier_summary: dict | None) -> str:
 def _format_next_action(next_action: str | None) -> str:
     mapping = {
         "finish_current_batch": "先完成当前批次",
+        "check_subagent_heartbeat": "先做一次子代理心跳巡检",
+        "investigate_stuck_subagents": "先介入卡住的子代理和文件",
         "resume": "继续领取下一批",
         "report": "生成最终报告",
         "ask_user_about_tier_2": "向用户确认是否进入 2 档",
@@ -490,6 +587,41 @@ def _build_runtime_guidance(
             "internal_reason": f"{profile_summary} 当前允许范围内的文件已经处理完成，可以直接查看结果或结束本轮任务。",
         }
 
+    if next_action == "fix_current_batch_outputs":
+        verification = progress_summary.get("active_batch_verification") or {}
+        missing_cn = len(verification.get("missing_cn_files", []))
+        missing_originals = len(verification.get("missing_original_copies", []))
+        return {
+            "user_message": f"当前批次还有缺失输出，先补齐这批再继续。缺失 CN 文件 {missing_cn} 个，缺失原始复制文件 {missing_originals} 个。",
+            "internal_reason": (
+                f"{profile_summary} current batch is blocked by batch verification; "
+                f"missing_cn_files={missing_cn}, missing_original_copies={missing_originals}."
+            ),
+        }
+    if next_action == "check_subagent_heartbeat":
+        return {
+            "user_message": "当前批次仍在执行，先做一次 watchdog 巡检，确认子代理心跳仍然正常。",
+            "internal_reason": f"{profile_summary} 当前批次仍在进行中，已经达到巡检时间点，应先检查子代理心跳。",
+        }
+    if next_action == "investigate_stuck_subagents":
+        stale_files = progress_summary.get("stale_in_progress_file_count", 0)
+        stale_workers = progress_summary.get("stale_worker_count", 0)
+        recommended_actions = progress_summary.get("recommended_watchdog_actions", [])
+        action_hint = ""
+        if recommended_actions:
+            first_action = recommended_actions[0]
+            worker_text = first_action.get("worker_id") or "未绑定子代理"
+            action_hint = f" 先按 watchdog 建议动作清单介入，首条建议针对：{worker_text}。"
+        return {
+            "user_message": (
+                f"当前批次疑似有子代理卡住，先介入处理。卡住文件 {stale_files} 个，"
+                f"涉及子代理 {stale_workers} 个。{action_hint}".strip()
+            ),
+            "internal_reason": (
+                f"{profile_summary} watchdog 检测到卡住的子代理或文件，必须先处理卡住项，"
+                f"并按 recommended_actions 执行介入或重分配，再继续本批次。"
+            ),
+        }
     if next_action == "finish_current_batch":
         return {
             "user_message": "先完成当前这一批文件，完成后我再判断是否继续放开下一档。",
@@ -647,6 +779,21 @@ def build_parser() -> argparse.ArgumentParser:
     mark_parser.add_argument("--status", required=True, choices=["pending", "completed", "failed", "skipped"])
     mark_parser.add_argument("--error", help="失败原因，仅 status=failed 时使用")
 
+    heartbeat_parser = subparsers.add_parser(
+        "heartbeat",
+        help="子代理周期性回写心跳，声明自己仍在正常执行。",
+    )
+    heartbeat_parser.add_argument("job_ref", help="A-CN 目录、AAA-translate-output 目录，或其内部文件路径")
+    heartbeat_parser.add_argument("worker_id", help="子代理或 worker 的稳定标识")
+    heartbeat_parser.add_argument("file_ids", nargs="+", help="当前由该子代理负责的 file_id，可一次传多个")
+    heartbeat_parser.add_argument("--note", help="可选备注，例如当前处理阶段")
+
+    watchdog_parser = subparsers.add_parser(
+        "watchdog",
+        help="对当前活跃批次执行一次心跳巡检，识别卡住的子代理和文件。",
+    )
+    watchdog_parser.add_argument("job_ref", help="A-CN 目录、AAA-translate-output 目录，或其内部文件路径")
+
     report_parser = subparsers.add_parser(
         "report",
         help="基于 manifest、progress、lock 生成最终校验报告。",
@@ -677,6 +824,10 @@ def main() -> int:
             payload = decide_job_scope(args.job_ref, decision=args.decision)
         elif args.command == "mark":
             payload = mark_job_file(args.job_ref, args.file_id, status=args.status, error=args.error)
+        elif args.command == "heartbeat":
+            payload = heartbeat_job_files(args.job_ref, args.worker_id, args.file_ids, note=args.note)
+        elif args.command == "watchdog":
+            payload = watchdog_job(args.job_ref)
         else:
             payload = build_job_report(args.job_ref)
             if args.output:

@@ -1,172 +1,67 @@
 # project-cn
 
-> 将项目复制为同级 `A-CN` 中文镜像的通用 skill
+通用项目中文镜像 skill，适用于 Claude Code、Cursor、Gemini CLI 等支持 SKILL.md 规范的 AI 编程助手。
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+它会把原项目复制成同级 `-CN` 目录，保留原文件不覆盖，并为文档生成 `-CN` 翻译副本、为代码生成 `-CN` 中文注释增强副本。
 
-## 简介
+## 使用场景
 
-`project-cn` 用于把一个项目目录复制为同级中文镜像目录：
+| 场景 | 说明 |
+|------|------|
+| 开源项目中文化 | 将英文 README、文档、注释翻译成中文，方便中文开发者阅读和贡献 |
+| 团队文档本地化 | 公司内部工具的英文文档批量生成中文版本，降低新人上手门槛 |
+| 技术文档双语对照 | 保留原始英文文件的同时生成 `-CN` 副本，方便中英文对照阅读 |
+| 代码注释中文增强 | 为代码文件生成带中文注释的副本，帮助中文团队理解代码逻辑 |
+| 大型项目分批处理 | 通过分档策略（1/2/3 档）控制翻译优先级，先翻译核心文档，再逐步扩展 |
+| 断点续翻 | 大项目翻译中断后可通过 `resume` 从上次停止的地方继续，不浪费已完成的工作 |
+| 多子代理协作 | 主 agent 分配文件给多个子代理并行翻译，通过 `heartbeat` 和 `watchdog` 监控进度 |
 
-- 原目录 `A` 不改
-- 新目录为 `A-CN`
-- 原始复制文件保留
-- 文档生成同目录 `-CN` 翻译副本
-- 代码生成同目录 `-CN` 中文注释增强副本
-- 额外产物统一进入 `A-CN/AAA-translate-output`
+## 安装
 
-它是一个通用 skill，不绑定单一 agent，实现重点是：
-
-- 先完整评估，再执行
-- 开始时先做项目画像分析，再决定哪些目录固定进 1 档，哪些目录按项目用途动态提升
-- 大项目按 `1/2/3` 档分层推进
-- 支持 `status / resume / scope / mark / report`
-- `start / status / report` 都会输出用户可读的项目画像摘要
-- `start / status / report / scope` 会拆分输出 `user_message` 和 `internal_reason`
-- 支持中断续跑和结果校验
-- 不依赖外部翻译或注释 API
-
-## 快速使用
+### 方式一：Skills CLI（推荐）
 
 ```bash
-# 创建作业并复制目录
-python "<skill_dir>/scripts/job_runner.py" start "<src_root>"
-
-# 查看当前状态
-python "<skill_dir>/scripts/job_runner.py" status "<A-CN>"
-
-# 继续下一批
-python "<skill_dir>/scripts/job_runner.py" resume "<A-CN>"
-
-# 写入档位决策
-python "<skill_dir>/scripts/job_runner.py" scope "<A-CN>" --decision tier_1_and_2
-
-# 单文件处理完成后回写状态
-python "<skill_dir>/scripts/job_runner.py" mark "<A-CN>" "<file_id>" --status completed
-
-# 生成最终报告
-python "<skill_dir>/scripts/job_runner.py" report "<A-CN>"
+npx skills add Jasondd945/project-cn
 ```
 
-## 分档策略
-
-超大型项目会先按优先级分成三档：
-
-- `1 档`：核心理解层，例如 `README`、`CHANGELOG`、`agents/`、核心 API、前后端入口脚本
-- `2 档`：重要扩展层，例如重要 `docs`、工具脚本、支撑代码
-- `3 档`：外围噪声层，例如 `tests`、`fixtures`、历史 plan、archive、draft
-
-分档不是纯目录表匹配，而是两层一起做：
-
-- 固定规则：`README`、`CHANGELOG`、`LICENSE`、`agents/` 这类固定进入 `1 档`
-- 动态规则：先做项目画像识别，再把 `commands/`、`hooks/`、入口目录或关键根文件按项目用途动态提升到 `1 档`
-
-默认规则：
-
-- 小项目直接处理全部档位
-- 大项目默认先跑 `1 档`
-- `1 档` 完成后，再决定是否放开 `2 档`
-- `2 档` 完成后，再决定是否放开 `3 档`
-
-## 输出结构
-
-```text
-A-CN/
-├─ 原始复制文件
-├─ 文档 -CN 副本
-├─ 代码 -CN 副本
-└─ AAA-translate-output/
-   ├─ translate-job.json
-   ├─ translate-manifest.json
-   ├─ translate-progress.json
-   ├─ translate-originals-lock.json
-   ├─ translate-verify-report.json
-   └─ translate-final-report.txt
+```bash
+npx skills add Jasondd945/project-cn -g
 ```
 
-## 主要命令
-
-- `start`：评估项目、复制目录、初始化作业
-- `status`：查看范围、批次、锁定档位和下一步建议
-- `resume`：领取当前允许范围内的下一批文件
-- `scope`：写入用户对 `1/2/3` 档的决定
-- `mark`：逐文件回写完成或失败状态
-- `report`：生成最终 JSON 和文本报告
-
-## 约束
-
-- 不修改源目录
-- 不覆盖复制后的原始文件
-- 文档必须忠实直译
-- 代码只做中文注释增强，不改逻辑
-- 所有状态推进都以 `translate-manifest.json` 和 `translate-progress.json` 为准
-
-## 目录
-
-```text
-project-cn/
-├─ SKILL.md
-├─ README.md
-├─ agents/
-├─ references/
-├─ scripts/
-└─ tests/
+```bash
+npx skills add Jasondd945/project-cn --skill project-cn
 ```
 
-详细规则以 [SKILL.md](./SKILL.md) 为准。
+### 方式二：手动
 
+将 `SKILL.md`、`scripts/`、`references/` 复制到你的 `.claude/skills/project-cn/` 下。
 
-## 工作流程
+### 验证安装
 
-```
-用户请求
-    ↓
-【评估】分析项目规模、文件分类、预计耗时
-    ↓
-【准备】复制目录结构、生成清单、创建状态文件
-    ↓
-【处理】按批次处理文档和代码文件
-    ↓
-【校验】生成最终报告、验证完整性
+```bash
+npx skills list
 ```
 
-## 常见问题
+### 卸载
 
-### Q: 会修改原项目吗？
+```bash
+npx skills remove project-cn
+```
 
-**A**: 绝对不会。project-cn 会在同级目录创建 `A-CN`，原项目完全不变。
+## 核心能力
 
-### Q: 支持哪些文件类型？
-
-**A**:
-- 文档：`.md`, `.txt`, `.rst`, `.adoc`, README, LICENSE, CHANGELOG 等
-- 代码：`.py`, `.js`, `.ts`, `.java`, `.go`, `.rs`, `.c`, `.cpp`, `.sh`, `.sql` 等
-- 其他：配置文件、图片、PDF 等只复制不处理
-
-### Q: 如何中断和恢复？
-
-**A**:
-- 中断：直接 Ctrl+C 停止当前处理
-- 恢复：使用 `resume` 命令从断点继续
-
-### Q: 支持并行处理吗？
-
-**A**: 支持。对于大项目（文档和代码文件 >200），可以使用多子智能体并行处理，显著提升速度。
-
-## 文档
-
-- **[SKILL.md](./SKILL.md)** - 完整技能文档
-- **[references/document-rules.md](./references/document-rules.md)** - 文档翻译规则
-- **[references/code-rules.md](./references/code-rules.md)** - 代码注释规则
+- 先完整评估项目，再执行复制和中文副本生成
+- 支持文档、代码、其他文件三类分类
+- 大项目支持 `1/2/3` 档分层推进
+- 使用 `manifest + progress + lock` 做可恢复状态管理
+- 支持 `status / resume / scope / mark / report`
+- 已完成文件默认只保留元数据，不再把全文反复带回上下文
+- 提供有界 `headless_runner` 调度器，负责 `start / resume` 和停机条件，不负责替代模型翻译
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request。
-
-- 提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)
-- 安全问题请先看 [SECURITY.md](./SECURITY.md)
+欢迎提交 issue 和 pull request。开始之前，先看 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 ## 许可证
 
-本项目使用 [MIT License](./LICENSE)。
+本项目采用 [MIT License](./LICENSE)。
